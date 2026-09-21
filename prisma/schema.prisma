@@ -1,0 +1,534 @@
+// Prisma schema for IronPulse Gym Membership & Billing OS
+// Generator and Datasource definitions
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// ENUMS
+// -----------------------------------------------------------------------------
+
+enum UserRole {
+  OWNER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+enum MemberStatus {
+  ACTIVE
+  OVERDUE
+  EXPIRED
+  PAUSED
+}
+
+enum MembershipStatus {
+  ACTIVE
+  PAUSED
+  EXPIRED
+  CANCELLED
+}
+
+enum BillingFrequency {
+  MONTHLY
+  QUARTERLY
+  ANNUALLY
+}
+
+enum PaymentMethodType {
+  CARD
+  ACH
+  CASH
+  POS
+}
+
+enum PaymentMethodStatus {
+  ACTIVE
+  EXPIRED
+  REVOKED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+  OVERDUE
+}
+
+enum InvoiceStatus {
+  DRAFT
+  OPEN
+  PAID
+  OVERDUE
+  VOID
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAUSED
+  CANCELLED
+  PAST_DUE
+}
+
+enum PaymentAttemptStatus {
+  SUCCESS
+  FAILED
+  PENDING
+}
+
+enum ReminderType {
+  UPCOMING_PAYMENT
+  PAYMENT_FAILED
+  OVERDUE
+  MEMBERSHIP_EXPIRY
+}
+
+enum ReminderChannel {
+  EMAIL
+  SMS
+  WHATSAPP
+}
+
+enum ReminderStatus {
+  PENDING
+  SENT
+  DELIVERED
+  FAILED
+}
+
+enum ProviderStatus {
+  CONNECTED
+  DISCONNECTED
+  SANDBOX
+}
+
+enum IntegrationProvider {
+  TWILIO_SMS
+  SENDGRID_EMAIL
+  WHATSAPP_API
+}
+
+// -----------------------------------------------------------------------------
+// MODELS
+// -----------------------------------------------------------------------------
+
+/// Gym / Fitness Center tenant
+model Gym {
+  id           String   @id @default(uuid())
+  legalName    String
+  tradeName    String?
+  contactEmail String
+  phone        String?
+  address      String?
+  city         String?
+  state        String?
+  postalCode   String?
+  country      String?  @default("US")
+  timezone     String   @default("America/New_York")
+  currency     String   @default("USD")
+  logoUrl      String?  @db.LongText
+  website      String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Tenant scoped relations
+  users                 User[]
+  members               Member[]
+  membershipPlans       MembershipPlan[]
+  memberships           Membership[]
+  paymentMethods        PaymentMethod[]
+  payments              Payment[]
+  invoices              Invoice[]
+  recurringBillings     RecurringBilling[]
+  reminders             Reminder[]
+  notificationTemplates NotificationTemplate[]
+  paymentProviders      PaymentProvider[]
+  billingPolicy         BillingPolicy?
+  integrationSettings   IntegrationSetting[]
+  auditLogs             AuditLog[]
+
+  @@map("gyms")
+}
+
+/// Administrative User (Gym Owner / Administrator)
+model User {
+  id           String     @id @default(uuid())
+  gymId        String
+  name         String
+  email        String
+  passwordHash String
+  role         UserRole   @default(ADMIN)
+  status       UserStatus @default(ACTIVE)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  gym       Gym        @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  auditLogs AuditLog[]
+
+  @@unique([gymId, email])
+  @@index([gymId])
+  @@index([email])
+  @@map("users")
+}
+
+/// Gym Member Profile
+model Member {
+  id               String       @id @default(uuid())
+  gymId            String
+  memberId         String // Human-readable ID, e.g. MEM-8021
+  firstName        String
+  lastName         String
+  email            String
+  phone            String?
+  avatar           String?      @db.LongText
+  dob              DateTime?
+  emergencyContact String?
+  notes            String?      @db.Text
+  status           MemberStatus @default(ACTIVE)
+  joinDate         DateTime     @default(now())
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  gym               Gym                @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  memberships       Membership[]
+  paymentMethods    PaymentMethod[]
+  payments          Payment[]
+  invoices          Invoice[]
+  recurringBillings RecurringBilling[]
+  reminders         Reminder[]
+
+  @@unique([gymId, memberId])
+  @@index([gymId])
+  @@index([gymId, status])
+  @@index([email])
+  @@map("members")
+}
+
+/// Membership Plan Package
+model MembershipPlan {
+  id               String           @id @default(uuid())
+  gymId            String
+  name             String // e.g. VIP Athlete, Elite Performance, Standard Fitness
+  description      String?          @db.Text
+  price            Decimal          @db.Decimal(10, 2)
+  billingFrequency BillingFrequency @default(MONTHLY)
+  featureList      Json? // Array of strings representing perks
+  isActive         Boolean          @default(true)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  gym         Gym          @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  memberships Membership[]
+
+  @@index([gymId])
+  @@index([gymId, isActive])
+  @@map("membership_plans")
+}
+
+/// Member Subscription Instance
+model Membership {
+  id               String           @id @default(uuid())
+  gymId            String
+  memberId         String
+  planId           String
+  status           MembershipStatus @default(ACTIVE)
+  price            Decimal          @db.Decimal(10, 2)
+  billingFrequency BillingFrequency @default(MONTHLY)
+  startDate        DateTime         @default(now())
+  nextBillingDate  DateTime?
+  endDate          DateTime?
+  pausedAt         DateTime?
+  cancelledAt      DateTime?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  gym              Gym               @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  member           Member            @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  plan             MembershipPlan    @relation(fields: [planId], references: [id], onDelete: Restrict)
+  recurringBilling RecurringBilling?
+  payments         Payment[]
+  invoices         Invoice[]
+
+  @@index([gymId])
+  @@index([memberId])
+  @@index([planId])
+  @@index([status])
+  @@index([nextBillingDate])
+  @@map("memberships")
+}
+
+/// Tokenized Safe Payment Method
+model PaymentMethod {
+  id                      String              @id @default(uuid())
+  gymId                   String
+  memberId                String
+  provider                String // e.g. STRIPE, AUTHORIZE_NET
+  providerPaymentMethodId String? // Token identifier from gateway
+  type                    PaymentMethodType   @default(CARD)
+  brand                   String? // e.g. Visa, Mastercard, AMEX
+  last4                   String? // e.g. 4821
+  expMonth                Int?
+  expYear                 Int?
+  isDefault               Boolean             @default(false)
+  status                  PaymentMethodStatus @default(ACTIVE)
+  createdAt               DateTime            @default(now())
+  updatedAt               DateTime            @updatedAt
+
+  gym      Gym       @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  member   Member    @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  payments Payment[]
+
+  @@index([gymId])
+  @@index([memberId])
+  @@map("payment_methods")
+}
+
+/// Invoices billed to Members
+model Invoice {
+  id            String        @id @default(uuid())
+  gymId         String
+  memberId      String
+  membershipId  String?
+  invoiceNumber String // e.g. INV-2026-8902
+  subtotal      Decimal       @db.Decimal(10, 2)
+  tax           Decimal       @default(0.00) @db.Decimal(10, 2)
+  total         Decimal       @db.Decimal(10, 2)
+  dueDate       DateTime
+  status        InvoiceStatus @default(OPEN)
+  paidAt        DateTime?
+  notes         String?       @db.Text
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  gym        Gym         @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  member     Member      @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  membership Membership? @relation(fields: [membershipId], references: [id], onDelete: SetNull)
+  payments   Payment[]
+  reminders  Reminder[]
+
+  @@unique([gymId, invoiceNumber])
+  @@index([gymId])
+  @@index([memberId])
+  @@index([status])
+  @@index([dueDate])
+  @@map("invoices")
+}
+
+/// Transaction Ledger Record
+model Payment {
+  id                String            @id @default(uuid())
+  gymId             String
+  memberId          String
+  membershipId      String?
+  invoiceId         String?
+  paymentMethodId   String?
+  provider          String?
+  providerPaymentId String?
+  amount            Decimal           @db.Decimal(10, 2)
+  currency          String            @default("USD")
+  status            PaymentStatus     @default(PENDING)
+  paymentMethodType PaymentMethodType @default(CARD)
+  failureReason     String?           @db.Text
+  transactionDate   DateTime          @default(now())
+  settledDate       DateTime?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  gym             Gym              @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  member          Member           @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  membership      Membership?      @relation(fields: [membershipId], references: [id], onDelete: SetNull)
+  invoice         Invoice?         @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  paymentMethod   PaymentMethod?   @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
+  paymentAttempts PaymentAttempt[]
+  reminders       Reminder[]
+
+  @@index([gymId])
+  @@index([memberId])
+  @@index([status])
+  @@index([transactionDate])
+  @@map("payments")
+}
+
+/// Recurring Membership Billing Schedule
+model RecurringBilling {
+  id                     String             @id @default(uuid())
+  gymId                  String
+  memberId               String
+  membershipId           String             @unique
+  provider               String?
+  providerSubscriptionId String?
+  amount                 Decimal            @db.Decimal(10, 2)
+  currency               String             @default("USD")
+  billingFrequency       BillingFrequency   @default(MONTHLY)
+  nextBillingDate        DateTime
+  status                 SubscriptionStatus @default(ACTIVE)
+  retryCount             Int                @default(0)
+  lastRetryDate          DateTime?
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+
+  gym        Gym        @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  member     Member     @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  membership Membership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+
+  @@index([gymId])
+  @@index([memberId])
+  @@index([status])
+  @@index([nextBillingDate])
+  @@map("recurring_billings")
+}
+
+/// Payment Attempts for Smart Retries and Dunning
+model PaymentAttempt {
+  id               String               @id @default(uuid())
+  paymentId        String
+  attemptNumber    Int                  @default(1)
+  attemptedAt      DateTime             @default(now())
+  status           PaymentAttemptStatus @default(PENDING)
+  failureCode      String?
+  failureReason    String?              @db.Text
+  providerResponse Json? // Sanitized gateway response
+  createdAt        DateTime             @default(now())
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([paymentId])
+  @@index([attemptedAt])
+  @@map("payment_attempts")
+}
+
+/// Dues Reminders & Notifications Log
+model Reminder {
+  id            String          @id @default(uuid())
+  gymId         String
+  memberId      String
+  paymentId     String?
+  invoiceId     String?
+  membershipId  String?
+  type          ReminderType
+  channel       ReminderChannel
+  scheduledAt   DateTime        @default(now())
+  sentAt        DateTime?
+  status        ReminderStatus  @default(PENDING)
+  message       String          @db.Text
+  failureReason String?         @db.Text
+  trigger       String?         @default("SYSTEM_AUTOMATED")
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  gym     Gym      @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  member  Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  payment Payment? @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  invoice Invoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+
+  @@index([gymId])
+  @@index([memberId])
+  @@index([status])
+  @@index([scheduledAt])
+  @@map("reminders")
+}
+
+/// Reusable Notification Template
+model NotificationTemplate {
+  id        String          @id @default(uuid())
+  gymId     String
+  name      String
+  type      ReminderType
+  channel   ReminderChannel
+  subject   String?
+  body      String          @db.Text
+  isActive  Boolean         @default(true)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  gym Gym @relation(fields: [gymId], references: [id], onDelete: Cascade)
+
+  @@unique([gymId, name])
+  @@index([gymId])
+  @@index([type])
+  @@map("notification_templates")
+}
+
+/// Payment Provider Credentials Reference (No raw secrets)
+model PaymentProvider {
+  id                String         @id @default(uuid())
+  gymId             String
+  provider          String // e.g. STRIPE, AUTHORIZE_NET
+  status            ProviderStatus @default(DISCONNECTED)
+  merchantAccountId String?
+  environment       String         @default("sandbox") // sandbox or production
+  config            Json? // Safe public keys, webhooks, merchant refs
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  gym Gym @relation(fields: [gymId], references: [id], onDelete: Cascade)
+
+  @@unique([gymId, provider])
+  @@index([gymId])
+  @@map("payment_providers")
+}
+
+/// Billing & Dunning Policy Rules
+model BillingPolicy {
+  id                     String   @id @default(uuid())
+  gymId                  String   @unique
+  defaultGracePeriodDays Int      @default(5)
+  retryCadenceDays       Json // e.g. [1, 3, 5, 7]
+  latePaymentFee         Decimal  @default(15.00) @db.Decimal(10, 2)
+  salesTaxPercentage     Decimal  @default(8.50) @db.Decimal(5, 2)
+  currency               String   @default("USD")
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  gym Gym @relation(fields: [gymId], references: [id], onDelete: Cascade)
+
+  @@map("billing_policies")
+}
+
+/// Integration Gateways (SMS, Email, WhatsApp)
+model IntegrationSetting {
+  id        String              @id @default(uuid())
+  gymId     String
+  provider  IntegrationProvider
+  isEnabled Boolean             @default(false)
+  config    Json? // Sender ID, From Email/Phone, Webhooks
+  createdAt DateTime            @default(now())
+  updatedAt DateTime            @updatedAt
+
+  gym Gym @relation(fields: [gymId], references: [id], onDelete: Cascade)
+
+  @@unique([gymId, provider])
+  @@index([gymId])
+  @@map("integration_settings")
+}
+
+/// Audit Trail for Financial & Administrative Actions
+model AuditLog {
+  id        String   @id @default(uuid())
+  gymId     String
+  userId    String?
+  action    String // e.g. MEMBER_ENROLLED, PAYMENT_SETTLED, REMINDER_SENT
+  entity    String // e.g. Member, Payment, Invoice, BillingPolicy
+  entityId  String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  gym  Gym   @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([gymId])
+  @@index([gymId, entity])
+  @@index([createdAt])
+  @@map("audit_logs")
+}

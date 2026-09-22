@@ -121,3 +121,21 @@ export const batchExpiryReminders = async (req, res) => {
   }
 };
 
+export const executeRetry = async (req, res) => {
+  try {
+    const { paymentId } = req.params;
+    const result = await DunningService.executeRetryAttempt({
+      gymId: req.user.gymId,
+      paymentId
+    });
+    return res.status(200).json({
+      success: result.success,
+      message: result.success ? 'Dunning retry succeeded and restored account.' : 'Dunning retry attempted.',
+      data: result
+    });
+  } catch (err) {
+    const status = err.statusCode || 500;
+    return res.status(status).json({ success: false, message: err.message });
+  }
+};
+

@@ -368,6 +368,75 @@ export class MembershipService {
       message: 'Membership deleted successfully'
     };
   }
+
+  /**
+   * Automatically detect and transition expired memberships to EXPIRED status
+   * Also cancels any active recurring billing schedule and logs audit trail.
+   */
+  static async processExpiredMemberships(gymId = null) {
+    const now = new Date();
+    const where = {
+      status: 'ACTIVE',
+      endDate: {
+        lt: now
+      }
+    };
+    if (gymId) {
+      where.gymId = gymId;
+    }
+
+    const expiredList = await prisma.membership.findMany({
+      where,
+      include: {
+        member: true,
+        recurringBilling: true
+      }
+    });
+
+    const results = [];
+    for (const membership of expiredList) {
+      // 1. Update membership status
+      await prisma.membership.update({
+        where: { id: membership.id },
+        data: { status: 'EXPIRED' }
+      });
+
+      // 2. Cancel associated active recurring billing
+      if (membership.recurringBilling && membership.recurringBilling.status === 'ACTIVE') {
+        await prisma.recurringBilling.update({
+          where: { id: membership.recurringBilling.id },
+          data: { status: 'CANCELLED' }
+        });
+      }
+
+      // 3. Check if member has other active memberships; if none, update member status to EXPIRED
+      const otherActive = await prisma.membership.count({
+        where: {
+          memberId: membership.memberId,
+          status: 'ACTIVE',
+          id: { not: membership.id }
+        }
+      });
+
+      if (otherActive === 0) {
+        await prisma.member.update({
+          where: { id: membership.memberId },
+          data: { status: 'EXPIRED' }
+        });
+      }
+
+      results.push({
+        membershipId: membership.id,
+        memberId: membership.memberId,
+        memberName: `${membership.member.firstName} ${membership.member.lastName}`
+      });
+    }
+
+    return {
+      processedCount: results.length,
+      expiredMemberships: results
+    };
+  }
 }
 
 export default MembershipService;

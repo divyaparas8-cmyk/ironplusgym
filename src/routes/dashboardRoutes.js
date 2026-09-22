@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getOverview } from '../controllers/dashboardController.js';
+import { getOverview, getTimeSeries } from '../controllers/dashboardController.js';
 import { verifyAuth } from '../middleware/auth.js';
 
 const router = Router();
@@ -7,5 +7,6 @@ const router = Router();
 router.use(verifyAuth);
 
 router.get('/overview', getOverview);
+router.get('/time-series', getTimeSeries);
 
 export default router;

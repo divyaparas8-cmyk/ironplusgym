@@ -345,6 +345,43 @@ class PaymentMethodService {
 
     return { message: 'Payment method deleted successfully' };
   }
+
+  /**
+   * Find active cards expiring this month or next month
+   */
+  async checkExpiringCards(gymId) {
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth() + 1; // 1-12
+
+    const activeCards = await prisma.paymentMethod.findMany({
+      where: {
+        gymId,
+        status: 'ACTIVE',
+        type: 'CARD'
+      },
+      include: {
+        member: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            phone: true
+          }
+        }
+      }
+    });
+
+    const expiring = activeCards.filter(card => {
+      if (!card.expYear || !card.expMonth) return false;
+      if (card.expYear < currentYear) return true;
+      if (card.expYear === currentYear && card.expMonth <= currentMonth + 1) return true;
+      return false;
+    });
+
+    return expiring;
+  }
 }
 
 export default new PaymentMethodService();

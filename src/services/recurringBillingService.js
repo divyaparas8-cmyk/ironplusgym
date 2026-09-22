@@ -1,4 +1,6 @@
 import prisma from '../prisma.js';
+import paymentGateway from './paymentGateway/paymentGateway.js';
+import DunningService from './dunningService.js';
 import { ALLOWED_SUBSCRIPTION_STATUS_TRANSITIONS } from '../validators/recurringBillingValidator.js';
 
 /**
@@ -570,6 +572,10 @@ class RecurringBillingService {
 
     const year = now.getFullYear();
 
+    // Retrieve tenant's billing policy for tax rate
+    const policy = await prisma.billingPolicy.findUnique({ where: { gymId } });
+    const taxRate = policy ? Number(policy.salesTaxPercentage) || 0 : 0;
+
     for (const schedule of dueSchedules) {
       try {
         // Resolve active payment method
@@ -604,6 +610,11 @@ class RecurringBillingService {
             return { skipped: true, reason: 'Invoice already exists for this cycle' };
           }
 
+          // Calculate subtotal and tax
+          const subtotal = Number(schedule.amount);
+          const tax = Math.round((subtotal * (taxRate / 100)) * 100) / 100;
+          const total = subtotal + tax;
+
           // Generate unique invoice number
           const randomSuffix = Math.floor(1000 + Math.random() * 9000);
           const invoiceNumber = `INV-${year}-${randomSuffix}-${Date.now().toString().slice(-4)}`;
@@ -615,16 +626,16 @@ class RecurringBillingService {
               memberId: schedule.memberId,
               membershipId: schedule.membershipId,
               invoiceNumber,
-              subtotal: schedule.amount,
-              tax: 0.00,
-              total: schedule.amount,
+              subtotal,
+              tax,
+              total,
               dueDate: schedule.nextBillingDate,
               status: 'OPEN',
-              notes: `Automated recurring billing (${schedule.billingFrequency})`
+              notes: `Automated recurring billing (${schedule.billingFrequency}) - Subtotal: $${subtotal.toFixed(2)}, Tax: $${tax.toFixed(2)}`
             }
           });
 
-          // 2. Create Payment ledger record as PENDING (no fake external gateway success)
+          // 2. Initial Payment record
           const payment = await tx.payment.create({
             data: {
               gymId,
@@ -632,34 +643,101 @@ class RecurringBillingService {
               membershipId: schedule.membershipId,
               invoiceId: invoice.id,
               paymentMethodId: paymentMethod ? paymentMethod.id : null,
-              amount: schedule.amount,
-              currency: schedule.currency,
+              amount: total,
+              currency: schedule.currency || 'USD',
               status: 'PENDING',
               paymentMethodType: paymentMethod ? paymentMethod.type : 'CARD',
-              provider: schedule.provider || 'MANUAL',
+              provider: paymentMethod ? paymentMethod.provider : 'MANUAL',
               transactionDate: now,
               failureReason: paymentMethod ? null : 'No active payment method on file at drafting'
             }
           });
 
-          // 3. Advance nextBillingDate atomically
-          const nextDate = calculateNextBillingDate(schedule.nextBillingDate, schedule.billingFrequency);
-          await tx.recurringBilling.update({
-            where: { id: schedule.id },
-            data: {
-              nextBillingDate: nextDate,
-              lastRetryDate: now
-            }
-          });
-
-          return { skipped: false, invoiceId: invoice.id, paymentId: payment.id };
+          return { skipped: false, invoiceId: invoice.id, paymentId: payment.id, total, subtotal, tax };
         });
 
         if (outcome.skipped) {
           results.skipped++;
-        } else {
-          results.processed++;
+          continue;
         }
+
+        // 3. Post-invoice Gateway Charge Execution
+        if (paymentMethod && paymentMethod.status === 'ACTIVE') {
+          const chargeRes = await paymentGateway.createRecurringCharge({
+            amount: outcome.total,
+            currency: schedule.currency || 'USD',
+            paymentMethodType: paymentMethod.type,
+            providerPaymentMethodId: paymentMethod.providerPaymentMethodId,
+            customerId: schedule.member.id
+          });
+
+          if (chargeRes.status === 'PAID') {
+            const nextDate = calculateNextBillingDate(schedule.nextBillingDate, schedule.billingFrequency);
+            await prisma.$transaction([
+              prisma.payment.update({
+                where: { id: outcome.paymentId },
+                data: {
+                  status: 'PAID',
+                  settledDate: now,
+                  providerPaymentId: chargeRes.providerPaymentId
+                }
+              }),
+              prisma.invoice.update({
+                where: { id: outcome.invoiceId },
+                data: { status: 'PAID', paidAt: now }
+              }),
+              prisma.recurringBilling.update({
+                where: { id: schedule.id },
+                data: { nextBillingDate: nextDate, lastRetryDate: now, status: 'ACTIVE' }
+              })
+            ]);
+          } else if (chargeRes.status === 'FAILED') {
+            await prisma.$transaction([
+              prisma.payment.update({
+                where: { id: outcome.paymentId },
+                data: { status: 'FAILED', failureReason: chargeRes.failureReason }
+              }),
+              prisma.recurringBilling.update({
+                where: { id: schedule.id },
+                data: { status: 'PAST_DUE' }
+              })
+            ]);
+            // Trigger Dunning failure evaluation
+            await DunningService.evaluateFailedPayment({
+              gymId,
+              paymentId: outcome.paymentId,
+              failureReason: chargeRes.failureReason || 'Provider recurring charge failed'
+            });
+          } else {
+            // Configuration Required: Remains PENDING with clear reason, schedule advances
+            const nextDate = calculateNextBillingDate(schedule.nextBillingDate, schedule.billingFrequency);
+            await prisma.payment.update({
+              where: { id: outcome.paymentId },
+              data: { failureReason: 'Gateway configuration required for live recurring charge' }
+            });
+            await prisma.recurringBilling.update({
+              where: { id: schedule.id },
+              data: { nextBillingDate: nextDate, lastRetryDate: now }
+            });
+          }
+        } else {
+          // No payment method on file: mark FAILED and trigger dunning
+          await prisma.payment.update({
+            where: { id: outcome.paymentId },
+            data: { status: 'FAILED', failureReason: 'No active payment method on file' }
+          });
+          await prisma.recurringBilling.update({
+            where: { id: schedule.id },
+            data: { status: 'PAST_DUE' }
+          });
+          await DunningService.evaluateFailedPayment({
+            gymId,
+            paymentId: outcome.paymentId,
+            failureReason: 'No active payment method on file'
+          });
+        }
+
+        results.processed++;
       } catch (err) {
         results.errors.push({
           scheduleId: schedule.id,

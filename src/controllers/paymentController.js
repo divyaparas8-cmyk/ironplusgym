@@ -1,4 +1,5 @@
 import PaymentService from '../services/paymentService.js';
+import auditLogService from '../services/auditLogService.js';
 import {
   validateGetPaymentsQuery,
   validateCreatePayment,
@@ -121,6 +122,14 @@ export const manualSettle = async (req, res) => {
       notes: req.body.notes
     });
 
+    auditLogService.logAction(req.user.gymId, {
+      userId: req.user.userId,
+      action: 'PAYMENT_MANUALLY_SETTLED',
+      entity: 'Payment',
+      entityId: req.body.paymentId,
+      metadata: { reference: req.body.settlementReference }
+    }).catch(() => {});
+
     return res.status(200).json({
       success: true,
       message: 'Payment settled successfully',
@@ -156,6 +165,14 @@ export const refundPayment = async (req, res) => {
       paymentId: req.params.id,
       reason: req.body.reason
     });
+
+    auditLogService.logAction(req.user.gymId, {
+      userId: req.user.userId,
+      action: 'PAYMENT_REFUNDED',
+      entity: 'Payment',
+      entityId: req.params.id,
+      metadata: { reason: req.body.reason }
+    }).catch(() => {});
 
     return res.status(200).json({
       success: true,

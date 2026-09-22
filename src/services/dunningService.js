@@ -1,5 +1,6 @@
 import prisma from '../prisma.js';
 import ReminderService from './reminderService.js';
+import paymentGateway from './paymentGateway/paymentGateway.js';
 
 export class DunningService {
   /**
@@ -354,6 +355,168 @@ export class DunningService {
       totalRemindersCount,
       recentAttempts
     };
+  }
+
+  /**
+   * Execute an active provider retry charge attempt
+   */
+  static async executeRetryAttempt({ gymId, paymentId }) {
+    const payment = await prisma.payment.findFirst({
+      where: { id: paymentId, gymId },
+      include: {
+        member: {
+          include: {
+            paymentMethods: {
+              where: { status: 'ACTIVE' },
+              orderBy: { isDefault: 'desc' }
+            }
+          }
+        },
+        invoice: true,
+        paymentAttempts: { orderBy: { attemptNumber: 'asc' } },
+        membership: true
+      }
+    });
+
+    if (!payment) {
+      const error = new Error('Payment not found');
+      error.statusCode = 404;
+      throw error;
+    }
+
+    if (payment.status === 'PAID') {
+      return { success: true, status: 'ALREADY_SETTLED', message: 'Payment is already settled.' };
+    }
+
+    const policy = await this.getTenantBillingPolicy(gymId);
+    const maxRetries = policy.retryCadenceDays.length;
+    const nextAttemptNumber = payment.paymentAttempts.length + 1;
+    const paymentMethod = payment.paymentMethodId
+      ? await prisma.paymentMethod.findFirst({ where: { id: payment.paymentMethodId, gymId } })
+      : (payment.member.paymentMethods[0] || null);
+
+    const chargeRes = await paymentGateway.retryPayment({
+      amount: payment.amount,
+      currency: payment.currency,
+      paymentMethodType: paymentMethod ? paymentMethod.type : 'CARD',
+      providerPaymentMethodId: paymentMethod ? paymentMethod.providerPaymentMethodId : null,
+      customerId: payment.memberId,
+      attemptNumber: nextAttemptNumber
+    });
+
+    const now = new Date();
+
+    if (chargeRes.status === 'PAID') {
+      // Successful retry: Restore financial health atomically
+      await prisma.$transaction([
+        prisma.paymentAttempt.create({
+          data: {
+            paymentId: payment.id,
+            attemptNumber: nextAttemptNumber,
+            status: 'SUCCESS',
+            failureReason: null,
+            providerResponse: { providerPaymentId: chargeRes.providerPaymentId, status: 'PAID' }
+          }
+        }),
+        prisma.payment.update({
+          where: { id: payment.id },
+          data: { status: 'PAID', settledDate: now, providerPaymentId: chargeRes.providerPaymentId, failureReason: null }
+        }),
+        ...(payment.invoiceId ? [
+          prisma.invoice.update({
+            where: { id: payment.invoiceId },
+            data: { status: 'PAID', paidAt: now }
+          })
+        ] : []),
+        ...(payment.membershipId ? [
+          prisma.recurringBilling.updateMany({
+            where: { membershipId: payment.membershipId, gymId },
+            data: { status: 'ACTIVE', retryCount: 0 }
+          })
+        ] : []),
+        prisma.member.update({
+          where: { id: payment.memberId },
+          data: { status: 'ACTIVE' }
+        }),
+        prisma.auditLog.create({
+          data: {
+            gymId,
+            action: 'DUNNING_RETRY_SUCCESS',
+            entity: 'Payment',
+            entityId: payment.id,
+            metadata: { attemptNumber: nextAttemptNumber, providerPaymentId: chargeRes.providerPaymentId }
+          }
+        })
+      ]);
+
+      return { success: true, status: 'PAID', attemptNumber: nextAttemptNumber };
+    } else {
+      // Failed retry: Record failure and evaluate exhaustion
+      const isExhausted = nextAttemptNumber >= maxRetries;
+      const failureReason = chargeRes.failureReason || 'Provider retry charge declined';
+
+      await prisma.$transaction(async (tx) => {
+        await tx.paymentAttempt.create({
+          data: {
+            paymentId: payment.id,
+            attemptNumber: nextAttemptNumber,
+            status: 'FAILED',
+            failureReason,
+            providerResponse: { error: failureReason, attemptNumber: nextAttemptNumber }
+          }
+        });
+
+        await tx.payment.update({
+          where: { id: payment.id },
+          data: { failureReason }
+        });
+
+        if (isExhausted) {
+          // Apply late fee to invoice if not already applied
+          if (payment.invoiceId && policy.latePaymentFee > 0) {
+            const inv = await tx.invoice.findUnique({ where: { id: payment.invoiceId } });
+            if (inv && inv.status !== 'PAID' && !inv.notes?.includes('[LATE FEE APPLIED]')) {
+              const newTotal = Number(inv.total) + policy.latePaymentFee;
+              await tx.invoice.update({
+                where: { id: payment.invoiceId },
+                data: {
+                  status: 'OVERDUE',
+                  total: newTotal,
+                  notes: inv.notes ? `${inv.notes} | [LATE FEE APPLIED: $${policy.latePaymentFee.toFixed(2)}]` : `[LATE FEE APPLIED: $${policy.latePaymentFee.toFixed(2)}]`
+                }
+              });
+            } else if (inv && inv.status !== 'PAID') {
+              await tx.invoice.update({
+                where: { id: payment.invoiceId },
+                data: { status: 'OVERDUE' }
+              });
+            }
+          }
+
+          await tx.member.update({
+            where: { id: payment.memberId },
+            data: { status: 'OVERDUE' }
+          });
+
+          await tx.auditLog.create({
+            data: {
+              gymId,
+              action: 'DUNNING_EXHAUSTED',
+              entity: 'Payment',
+              entityId: payment.id,
+              metadata: { attemptNumber: nextAttemptNumber, maxRetries, lateFeeApplied: policy.latePaymentFee }
+            }
+          });
+        }
+      });
+
+      return {
+        success: false,
+        status: isExhausted ? 'DUNNING_EXHAUSTED' : 'RETRY_SCHEDULED',
+        attemptNumber: nextAttemptNumber,
+        failureReason
+      };
+    }
   }
 }
 

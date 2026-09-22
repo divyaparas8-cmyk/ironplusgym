@@ -1,4 +1,5 @@
 import prisma from '../prisma.js';
+import auditLogService from './auditLogService.js';
 
 export class MemberService {
   /**
@@ -210,6 +211,195 @@ export class MemberService {
   }
 
   /**
+   * Composite Enrollment Flow: Atomically creates Member, Membership, PaymentMethod (if applicable),
+   * Initial Invoice (with sales tax calculation), RecurringBilling schedule, and AuditLog in a single transaction.
+   */
+  static async enrollMember({ gymId, userId, data }) {
+    const normalizedEmail = data.email.trim().toLowerCase();
+
+    // Check duplicate email within the same gym tenant
+    const duplicateEmail = await prisma.member.findFirst({
+      where: {
+        gymId,
+        email: normalizedEmail
+      },
+      select: { id: true }
+    });
+
+    if (duplicateEmail) {
+      const error = new Error('A member with this email address already exists');
+      error.statusCode = 409;
+      throw error;
+    }
+
+    const memberIdCode = await this.generateUniqueMemberId(gymId);
+
+    // Fetch tenant billing policy for sales tax
+    const policy = await prisma.billingPolicy.findUnique({
+      where: { gymId }
+    });
+    const salesTaxRate = policy ? Number(policy.salesTaxPercentage) || 0 : 0;
+
+    let plan = null;
+    if (data.planId) {
+      plan = await prisma.membershipPlan.findFirst({
+        where: { id: data.planId, gymId }
+      });
+      if (!plan) {
+        const error = new Error('Selected membership plan not found');
+        error.statusCode = 404;
+        throw error;
+      }
+    }
+
+    return await prisma.$transaction(async (tx) => {
+      // 1. Create Member
+      const member = await tx.member.create({
+        data: {
+          gymId,
+          memberId: memberIdCode,
+          firstName: data.firstName.trim(),
+          lastName: data.lastName.trim(),
+          email: normalizedEmail,
+          phone: data.phone ? data.phone.trim() : null,
+          avatar: data.avatar ? data.avatar.trim() : null,
+          dob: data.dob ? new Date(data.dob) : null,
+          emergencyContact: data.emergencyContact ? data.emergencyContact.trim() : null,
+          notes: data.notes ? data.notes.trim() : null,
+          status: data.status || 'ACTIVE',
+          joinDate: data.startDate ? new Date(data.startDate) : new Date()
+        }
+      });
+
+      let membership = null;
+      let invoice = null;
+      let recurringBilling = null;
+      let paymentMethod = null;
+
+      // 2. Create PaymentMethod if electronic details provided
+      const rawMethod = data.paymentMethod ? String(data.paymentMethod).toUpperCase() : 'CARD';
+      const isElectronic = !['CASH', 'POS'].includes(rawMethod);
+      if (isElectronic) {
+        paymentMethod = await tx.paymentMethod.create({
+          data: {
+            gymId,
+            memberId: member.id,
+            provider: data.provider || 'STRIPE',
+            providerPaymentMethodId: data.providerPaymentMethodId || null,
+            type: rawMethod.includes('ACH') ? 'ACH' : 'CARD',
+            brand: data.brand || (rawMethod.includes('ACH') ? 'ACH' : 'Visa'),
+            last4: data.last4 ? String(data.last4).slice(-4) : '4242',
+            expMonth: data.expMonth ? parseInt(data.expMonth, 10) : 12,
+            expYear: data.expYear ? parseInt(data.expYear, 10) : new Date().getFullYear() + 3,
+            isDefault: true,
+            status: 'ACTIVE'
+          }
+        });
+      }
+
+      // 3. Create Membership if plan selected
+      if (plan) {
+        const price = data.recurringAmount !== undefined ? Number(data.recurringAmount) : (data.monthlyFee !== undefined ? Number(data.monthlyFee) : Number(plan.price));
+        const freqMap = {
+          'MONTHLY': 'MONTHLY',
+          'Monthly': 'MONTHLY',
+          'QUARTERLY': 'QUARTERLY',
+          'Quarterly': 'QUARTERLY',
+          'ANNUALLY': 'ANNUALLY',
+          'Annually': 'ANNUALLY',
+          'Annual': 'ANNUALLY'
+        };
+        const billingFrequency = freqMap[data.billingFrequency] || plan.billingFrequency || 'MONTHLY';
+        const startDate = data.startDate ? new Date(data.startDate) : new Date();
+
+        let nextBillingDate = data.nextPaymentDate ? new Date(data.nextPaymentDate) : null;
+        if (!nextBillingDate) {
+          nextBillingDate = new Date(startDate);
+          if (billingFrequency === 'ANNUALLY') nextBillingDate.setFullYear(nextBillingDate.getFullYear() + 1);
+          else if (billingFrequency === 'QUARTERLY') nextBillingDate.setMonth(nextBillingDate.getMonth() + 3);
+          else nextBillingDate.setMonth(nextBillingDate.getMonth() + 1);
+        }
+
+        membership = await tx.membership.create({
+          data: {
+            gymId,
+            memberId: member.id,
+            planId: plan.id,
+            price,
+            billingFrequency,
+            startDate,
+            nextBillingDate,
+            status: 'ACTIVE'
+          }
+        });
+
+        // 4. Create Initial Invoice with sales tax calculation
+        const subtotal = price;
+        const tax = Math.round((subtotal * (salesTaxRate / 100)) * 100) / 100;
+        const total = subtotal + tax;
+        const year = new Date().getFullYear();
+        const randSuffix = Math.floor(1000 + Math.random() * 9000);
+        const invoiceNumber = `INV-${year}-${randSuffix}-${Date.now().toString().slice(-4)}`;
+
+        invoice = await tx.invoice.create({
+          data: {
+            gymId,
+            memberId: member.id,
+            membershipId: membership.id,
+            invoiceNumber,
+            subtotal,
+            tax,
+            total,
+            dueDate: startDate,
+            status: 'OPEN',
+            notes: `Initial registration invoice for ${plan.name} (${billingFrequency})`
+          }
+        });
+
+        // 5. Create RecurringBilling schedule
+        recurringBilling = await tx.recurringBilling.create({
+          data: {
+            gymId,
+            memberId: member.id,
+            membershipId: membership.id,
+            amount: total,
+            currency: 'USD',
+            billingFrequency,
+            nextBillingDate,
+            status: 'ACTIVE'
+          }
+        });
+      }
+
+      // 6. Create AuditLog entry
+      await tx.auditLog.create({
+        data: {
+          gymId,
+          userId: userId || null,
+          action: 'MEMBER_ENROLLED',
+          entity: 'Member',
+          entityId: member.id,
+          metadata: {
+            memberId: member.memberId,
+            planId: plan?.id,
+            membershipId: membership?.id,
+            invoiceId: invoice?.id,
+            hasPaymentMethod: Boolean(paymentMethod)
+          }
+        }
+      });
+
+      return {
+        member,
+        membership,
+        paymentMethod,
+        invoice,
+        recurringBilling
+      };
+    });
+  }
+
+  /**
    * Update member profile fields scoped to tenant gym
    * @param {Object} params - { gymId, memberId, data }
    */
@@ -268,6 +458,13 @@ export class MemberService {
       data: updateData
     });
 
+    auditLogService.logAction(gymId, {
+      action: 'MEMBER_UPDATED',
+      entity: 'Member',
+      entityId: memberId,
+      metadata: { fieldsUpdated: Object.keys(updateData) }
+    }).catch(() => {});
+
     return updatedMember;
   }
 
@@ -294,6 +491,13 @@ export class MemberService {
       where: { id: memberId },
       data: { status }
     });
+
+    auditLogService.logAction(gymId, {
+      action: 'MEMBER_STATUS_CHANGED',
+      entity: 'Member',
+      entityId: memberId,
+      metadata: { newStatus: status }
+    }).catch(() => {});
 
     return updatedMember;
   }
@@ -335,6 +539,12 @@ export class MemberService {
     await prisma.member.delete({
       where: { id: memberId }
     });
+
+    auditLogService.logAction(gymId, {
+      action: 'MEMBER_DELETED',
+      entity: 'Member',
+      entityId: memberId
+    }).catch(() => {});
 
     return {
       message: 'Member deleted successfully'

@@ -222,6 +222,101 @@ export class AuthService {
       token
     };
   }
+
+  /**
+   * Request password reset token and send email
+   */
+  static async requestPasswordReset(email) {
+    if (!email || typeof email !== 'string') {
+      return { success: true, message: 'If an account exists, reset instructions have been sent.' };
+    }
+    const normalizedEmail = email.trim().toLowerCase();
+    const user = await prisma.user.findFirst({
+      where: { email: normalizedEmail }
+    });
+
+    if (!user) {
+      return { success: true, message: 'If an account exists, reset instructions have been sent.' };
+    }
+
+    const secret = (process.env.JWT_SECRET || 'ironpulse_super_secret_jwt_key_2026') + user.passwordHash;
+    const jwtModule = await import('jsonwebtoken');
+    const resetToken = jwtModule.default.sign(
+      { userId: user.id, email: user.email },
+      secret,
+      { expiresIn: '1h' }
+    );
+
+    const appUrl = process.env.APP_URL || 'http://localhost:5173';
+    const resetLink = `${appUrl}/reset-password?token=${resetToken}&email=${encodeURIComponent(user.email)}`;
+
+    try {
+      const { NotificationDispatcher } = await import('./notificationDispatcher.js');
+      await NotificationDispatcher.dispatchEmail({
+        to: user.email,
+        subject: 'IronPulse Gym - Password Reset Request',
+        body: `You requested a password reset for your IronPulse account. Click the link below to set a new password:\n\n${resetLink}\n\nThis link will expire in 1 hour. If you did not request this, please ignore this email.`
+      });
+    } catch (e) {
+      console.warn('Failed to dispatch reset email:', e.message);
+    }
+
+    return {
+      success: true,
+      message: 'If an account exists, reset instructions have been sent.',
+      resetToken // Return token for dev / testing environments
+    };
+  }
+
+  /**
+   * Complete password reset using stateless HMAC token
+   */
+  static async resetPassword({ token, email, newPassword }) {
+    if (!token || !email || !newPassword) {
+      const error = new Error('Token, email, and new password are required');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    if (typeof newPassword !== 'string' || newPassword.length < 8) {
+      const error = new Error('Password must be at least 8 characters long');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+    const user = await prisma.user.findFirst({
+      where: { email: normalizedEmail }
+    });
+
+    if (!user) {
+      const error = new Error('Invalid or expired reset token');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const secret = (process.env.JWT_SECRET || 'ironpulse_super_secret_jwt_key_2026') + user.passwordHash;
+    const jwtModule = await import('jsonwebtoken');
+
+    try {
+      jwtModule.default.verify(token, secret);
+    } catch (e) {
+      const error = new Error('Invalid or expired reset token');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { passwordHash }
+    });
+
+    return {
+      success: true,
+      message: 'Password reset successfully. You can now log in with your new credentials.'
+    };
+  }
 }
 
 export default AuthService;

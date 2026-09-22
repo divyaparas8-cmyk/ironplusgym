@@ -1,4 +1,5 @@
 import MembershipPlanService from '../services/membershipPlanService.js';
+import auditLogService from '../services/auditLogService.js';
 import {
   validateGetPlansQuery,
   validateCreatePlan,
@@ -84,6 +85,14 @@ export const createPlan = async (req, res) => {
       data: req.body
     });
 
+    auditLogService.logAction(req.user.gymId, {
+      userId: req.user.userId,
+      action: 'PLAN_CREATED',
+      entity: 'MembershipPlan',
+      entityId: created.id,
+      metadata: { name: created.name, price: created.price }
+    }).catch(() => {});
+
     return res.status(201).json({
       success: true,
       message: 'Membership plan created successfully',
@@ -119,6 +128,14 @@ export const updatePlan = async (req, res) => {
       planId: req.params.id,
       data: req.body
     });
+
+    auditLogService.logAction(req.user.gymId, {
+      userId: req.user.userId,
+      action: 'PLAN_UPDATED',
+      entity: 'MembershipPlan',
+      entityId: req.params.id,
+      metadata: { name: updated.name, price: updated.price }
+    }).catch(() => {});
 
     return res.status(200).json({
       success: true,
@@ -156,6 +173,14 @@ export const updatePlanStatus = async (req, res) => {
       isActive
     });
 
+    auditLogService.logAction(req.user.gymId, {
+      userId: req.user.userId,
+      action: 'PLAN_STATUS_CHANGED',
+      entity: 'MembershipPlan',
+      entityId: req.params.id,
+      metadata: { isActive }
+    }).catch(() => {});
+
     return res.status(200).json({
       success: true,
       message: 'Plan status updated successfully',
@@ -181,6 +206,13 @@ export const deletePlan = async (req, res) => {
       gymId: req.user.gymId,
       planId: req.params.id
     });
+
+    auditLogService.logAction(req.user.gymId, {
+      userId: req.user.userId,
+      action: 'PLAN_DELETED',
+      entity: 'MembershipPlan',
+      entityId: req.params.id
+    }).catch(() => {});
 
     return res.status(200).json({
       success: true,

@@ -1,4 +1,5 @@
 import prisma from '../prisma.js';
+import paymentGateway from './paymentGateway/paymentGateway.js';
 
 class PaymentService {
   /**
@@ -360,6 +361,21 @@ class PaymentService {
       const error = new Error(`Only settled (PAID) payments can be refunded. Current status is '${existing.status}'`);
       error.statusCode = 400;
       throw error;
+    }
+
+    // If payment was settled via an external provider, invoke Gateway refund first
+    if (existing.providerPaymentId && !existing.providerPaymentId.startsWith('MANUAL-')) {
+      const gatewayRefund = await paymentGateway.refundPayment({
+        providerPaymentId: existing.providerPaymentId,
+        amount: existing.amount,
+        reason: reason || 'Manual refund processed by admin'
+      });
+
+      if (!gatewayRefund.success && gatewayRefund.configured) {
+        const error = new Error(`Payment provider rejected refund: ${gatewayRefund.error || 'Unknown gateway error'}`);
+        error.statusCode = 502;
+        throw error;
+      }
     }
 
     // Preserve original settlement history and append refund audit note to failureReason field

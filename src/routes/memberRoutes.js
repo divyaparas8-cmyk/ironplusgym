@@ -3,6 +3,7 @@ import {
   getMembers,
   getMemberById,
   createMember,
+  enrollMember,
   updateMember,
   updateMemberStatus,
   deleteMember
@@ -14,6 +15,9 @@ const router = Router();
 
 // Apply authentication to all member endpoints
 router.use(verifyAuth);
+
+// POST /api/members/enroll - Atomic composite enrollment (Member + Membership + PaymentMethod + Invoice + RecurringBilling)
+router.post('/enroll', requireRole('OWNER', 'ADMIN'), enrollMember);
 
 // GET /api/members - List members with pagination, filtering, search, sorting
 router.get('/', getMembers);

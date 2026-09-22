@@ -2,6 +2,7 @@ import express from 'express';
 import {
   getDunningOverview,
   evaluatePaymentDunning,
+  executeRetry,
   processAllFailedPayments,
   batchUpcomingReminders,
   batchOverdueReminders,
@@ -18,7 +19,7 @@ router.use(verifyAuth);
 router.get('/overview', getDunningOverview);
 router.post('/process', requireRole('OWNER', 'ADMIN'), processAllFailedPayments);
 router.post('/evaluate/:paymentId', requireRole('OWNER', 'ADMIN'), evaluatePaymentDunning);
-router.post('/retry/:paymentId', requireRole('OWNER', 'ADMIN'), evaluatePaymentDunning);
+router.post('/retry/:paymentId', requireRole('OWNER', 'ADMIN'), executeRetry);
 router.post('/batch/upcoming', requireRole('OWNER', 'ADMIN'), batchUpcomingReminders);
 router.post('/batch/overdue', requireRole('OWNER', 'ADMIN'), batchOverdueReminders);
 router.post('/batch/expiry', requireRole('OWNER', 'ADMIN'), batchExpiryReminders);

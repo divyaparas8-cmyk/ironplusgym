@@ -1,5 +1,6 @@
 import AuthService from '../services/authService.js';
 import prisma from '../prisma.js';
+import auditLogService from '../services/auditLogService.js';
 
 /**
  * Handle POST /api/auth/login
@@ -8,6 +9,13 @@ export const login = async (req, res) => {
   try {
     const { email, password } = req.body || {};
     const result = await AuthService.login({ email, password });
+
+    auditLogService.logAction(result.user.gymId, {
+      userId: result.user.id,
+      action: 'USER_LOGIN',
+      entity: 'User',
+      entityId: result.user.id
+    }).catch(() => {});
 
     return res.status(200).json({
       success: true,
@@ -143,20 +151,31 @@ export const forgotPassword = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Email address is required' });
     }
 
-    const user = await prisma.user.findFirst({
-      where: { email: email.toLowerCase().trim() }
-    });
-
-    return res.status(200).json({
-      success: true,
-      message: 'If an account exists with that email, password reset instructions have been sent.',
-      data: { email: email.toLowerCase().trim() }
-    });
+    const result = await AuthService.requestPasswordReset(email);
+    return res.status(200).json(result);
   } catch (error) {
     return res.status(500).json({
       success: false,
-      message: 'Failed to process password reset request'
+      message: error.message || 'Failed to process password reset request'
     });
   }
 };
+
+/**
+ * Handle POST /api/auth/reset-password
+ */
+export const resetPassword = async (req, res) => {
+  try {
+    const { token, email, newPassword } = req.body || {};
+    const result = await AuthService.resetPassword({ token, email, newPassword });
+    return res.status(200).json(result);
+  } catch (error) {
+    const statusCode = error.statusCode || 500;
+    return res.status(statusCode).json({
+      success: false,
+      message: error.message || 'Failed to reset password'
+    });
+  }
+};
+
 

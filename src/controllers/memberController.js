@@ -101,6 +101,42 @@ export const createMember = async (req, res) => {
 };
 
 /**
+ * Handle POST /api/members/enroll (Composite enrollment flow)
+ */
+export const enrollMember = async (req, res) => {
+  try {
+    const { isValid, errors } = validateCreateMember(req.body);
+
+    if (!isValid) {
+      return res.status(400).json({
+        success: false,
+        message: errors.join('; ')
+      });
+    }
+
+    const result = await MemberService.enrollMember({
+      gymId: req.user.gymId,
+      userId: req.user.userId,
+      data: req.body
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Member enrolled successfully with all initial records',
+      data: result
+    });
+  } catch (error) {
+    const statusCode = error.statusCode || 500;
+    const message = statusCode === 500 ? 'Internal server error' : error.message;
+
+    return res.status(statusCode).json({
+      success: false,
+      message
+    });
+  }
+};
+
+/**
  * Handle PUT /api/members/:id
  */
 export const updateMember = async (req, res) => {

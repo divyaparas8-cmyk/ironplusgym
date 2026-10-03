@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
-import { login, register, getCurrentUser, updateGymSettings, forgotPassword, resetPassword } from '../controllers/authController.js';
+import { login, register, getCurrentUser, updateGymSettings, forgotPassword, resetPassword, getPublicPlans } from '../controllers/authController.js';
 import { verifyAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/authorize.js';
 
@@ -29,7 +29,8 @@ const passwordResetLimiter = rateLimit({
   }
 });
 
-// Public endpoints with rate limiting
+// Public endpoints
+router.get('/plans', getPublicPlans);
 router.post('/login', authLimiter, login);
 router.post('/register', authLimiter, register);
 router.post('/forgot-password', passwordResetLimiter, forgotPassword);

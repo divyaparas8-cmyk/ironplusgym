@@ -1,6 +1,7 @@
 import AuthService from '../services/authService.js';
 import prisma from '../prisma.js';
 import auditLogService from '../services/auditLogService.js';
+import GymSubscriptionService from '../services/gymSubscriptionService.js';
 
 /**
  * Handle POST /api/auth/login
@@ -188,4 +189,20 @@ export const resetPassword = async (req, res) => {
   }
 };
 
-
+/**
+ * Handle GET /api/auth/plans (Public SaaS Subscription Plans for Landing Page)
+ */
+export const getPublicPlans = async (req, res) => {
+  try {
+    const plans = await GymSubscriptionService.getAvailablePlans();
+    return res.status(200).json({
+      success: true,
+      data: plans
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to fetch public subscription plans'
+    });
+  }
+};

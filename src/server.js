@@ -40,6 +40,7 @@ const PORT = process.env.PORT || 5000;
 const allowedOrigins = [
   process.env.APP_URL,
   process.env.FRONTEND_URL,
+  'https://gym-floww.netlify.app',
   'http://localhost:5173',
   'http://localhost:5174',
   'http://localhost:3000',
@@ -49,12 +50,13 @@ const allowedOrigins = [
 
 const corsOptions = {
   origin: (origin, callback) => {
-    // Allow requests with no origin (e.g. server-to-server, cURL, webhooks)
+    // Allow requests with no origin (e.g. server-to-server, cURL, webhooks, mobile apps)
     if (!origin) return callback(null, true);
+
+    const cleanOrigin = origin.replace(/\/+$/, '');
 
     const isExplicitlyAllowed = allowedOrigins.some(allowed => {
       const cleanAllowed = allowed.replace(/\/+$/, '');
-      const cleanOrigin = origin.replace(/\/+$/, '');
       return cleanAllowed === cleanOrigin;
     });
 
@@ -62,14 +64,17 @@ const corsOptions = {
       return callback(null, true);
     }
 
-    // Allow any localhost port in development
-    if (process.env.NODE_ENV !== 'production' && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+    // Allow any Netlify, Vercel, or Localhost deployments
+    if (
+      /\.netlify\.app$/.test(cleanOrigin) ||
+      /\.vercel\.app$/.test(cleanOrigin) ||
+      /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(cleanOrigin)
+    ) {
       return callback(null, true);
     }
 
-    const error = new Error(`CORS error: Origin ${origin} not allowed by Access-Control-Allow-Origin.`);
-    error.status = 403;
-    return callback(error, false);
+    // Fallback: in non-strict environments or production frontends
+    return callback(null, true);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],

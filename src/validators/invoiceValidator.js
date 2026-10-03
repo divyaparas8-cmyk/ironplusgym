@@ -5,7 +5,7 @@ export const ALLOWED_INVOICE_STATUS_TRANSITIONS = {
   DRAFT: ['OPEN', 'VOID'],
   OPEN: ['PAID', 'OVERDUE', 'VOID'],
   OVERDUE: ['PAID', 'VOID'],
-  PAID: [], // Settled historical invoice cannot be reopened or reverted to draft
+  PAID: ['VOID'], // Settled historical invoice can transition to VOID upon full refund/cancellation
   VOID: []  // Voided record is strictly terminal
 };
 

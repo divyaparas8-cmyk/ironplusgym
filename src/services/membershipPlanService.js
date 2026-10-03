@@ -98,12 +98,19 @@ export class MembershipPlanService {
       throw error;
     }
 
+    const gymRecord = await prisma.gym.findUnique({
+      where: { id: gymId },
+      select: { currency: true }
+    });
+    const planCurrency = (data.currency || gymRecord?.currency || 'USD').toUpperCase();
+
     const created = await prisma.membershipPlan.create({
       data: {
         gymId,
         name: trimmedName,
         description: data.description ? data.description.trim() : null,
         price: data.price,
+        currency: planCurrency,
         billingFrequency: data.billingFrequency || 'MONTHLY',
         featureList: data.featureList || null,
         isActive: data.isActive !== undefined ? data.isActive : true
@@ -165,6 +172,7 @@ export class MembershipPlanService {
 
     if (data.description !== undefined) updateData.description = data.description ? data.description.trim() : null;
     if (data.price !== undefined) updateData.price = data.price;
+    if (data.currency !== undefined) updateData.currency = data.currency.toUpperCase();
     if (data.billingFrequency !== undefined) updateData.billingFrequency = data.billingFrequency;
     if (data.featureList !== undefined) updateData.featureList = data.featureList;
     if (data.isActive !== undefined) updateData.isActive = data.isActive;

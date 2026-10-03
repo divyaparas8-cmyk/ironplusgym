@@ -41,3 +41,15 @@ export const getPaymentsReport = async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 };
+
+export const getCommissionReport = async (req, res) => {
+  try {
+    const gymId = req.user.gymId;
+    const { range = '30d' } = req.query;
+    const data = await reportService.getCommissionReport(gymId, range);
+    res.json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+

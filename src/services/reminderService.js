@@ -102,8 +102,39 @@ export class ReminderService {
 
   /**
    * Create and prepare/dispatch a reminder
+  static async createReminder(params) {
+    const { channel = 'EMAIL', channels } = params;
+    let targetChannels = [];
+    if (Array.isArray(channels) && channels.length > 0) {
+      targetChannels = channels.map(c => String(c).toUpperCase());
+    } else if (String(channel).toUpperCase() === 'EMAIL_AND_SMS') {
+      targetChannels = ['EMAIL', 'SMS'];
+    } else {
+      targetChannels = [String(channel).toUpperCase()];
+    }
+
+    if (targetChannels.length > 1) {
+      const results = [];
+      for (const ch of targetChannels) {
+        const single = await this._createSingleReminder({
+          ...params,
+          channel: ch
+        });
+        results.push(single);
+      }
+      return results;
+    }
+
+    return await this._createSingleReminder({
+      ...params,
+      channel: targetChannels[0] || 'EMAIL'
+    });
+  }
+
+  /**
+   * Internal worker: Create and dispatch a single channel reminder
    */
-  static async createReminder({
+  static async _createSingleReminder({
     gymId,
     userId,
     memberId,
@@ -167,31 +198,6 @@ export class ReminderService {
       }
     }
 
-    // 3. Duplicate protection: Check for existing identical reminder within 24h window
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const duplicateWhere = {
-      gymId,
-      memberId,
-      type,
-      channel,
-      createdAt: { gte: oneDayAgo }
-    };
-
-    if (invoiceId) duplicateWhere.invoiceId = invoiceId;
-    if (paymentId) duplicateWhere.paymentId = paymentId;
-
-    const existingRecent = await prisma.reminder.findFirst({
-      where: duplicateWhere
-    });
-
-    if (existingRecent) {
-      // Return existing reminder to prevent duplicate messaging
-      return {
-        ...existingRecent,
-        isDuplicateSuppressed: true,
-        messageNotice: 'A matching reminder was already dispatched in the last 24 hours.'
-      };
-    }
 
     // 4. Resolve message template if not supplied
     const gymName = member.gym.tradeName || member.gym.legalName || 'IronPulse Gym';

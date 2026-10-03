@@ -20,7 +20,7 @@ export const handlePaymentWebhook = async (req, res) => {
       });
     }
 
-    const secret = process.env.WEBHOOK_SECRET;
+    const secret = process.env.STRIPE_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET;
     const { isValid, error: sigError } = verifyWebhookSignature({
       rawBody,
       signatureHeader,

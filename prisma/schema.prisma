@@ -15,8 +15,18 @@ datasource db {
 // -----------------------------------------------------------------------------
 
 enum UserRole {
+  SUPER_ADMIN
   OWNER
   ADMIN
+}
+
+enum GymSubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  GRACE_PERIOD
+  CANCELLED
+  EXPIRED
 }
 
 enum UserStatus {
@@ -119,13 +129,33 @@ enum IntegrationProvider {
   WHATSAPP_API
 }
 
+enum PaymentMode {
+  DIRECT_MERCHANT
+  CONNECT_PLATFORM
+}
+
+enum CommissionStatus {
+  PENDING
+  COLLECTED
+  REFUNDED
+  FAILED
+}
+
+enum PayoutStatus {
+  PENDING
+  IN_TRANSIT
+  PAID
+  FAILED
+  CANCELLED
+}
+
 // -----------------------------------------------------------------------------
 // MODELS
 // -----------------------------------------------------------------------------
 
 /// Gym / Fitness Center tenant
 model Gym {
-  id           String   @id @default(uuid())
+  id           String      @id @default(uuid())
   legalName    String
   tradeName    String?
   contactEmail String
@@ -134,37 +164,126 @@ model Gym {
   city         String?
   state        String?
   postalCode   String?
-  country      String?  @default("US")
-  timezone     String   @default("America/New_York")
-  currency     String   @default("USD")
-  logoUrl      String?  @db.LongText
+  country      String?     @default("US")
+  timezone     String      @default("America/New_York")
+  currency     String      @default("USD")
+  paymentMode  PaymentMode @default(DIRECT_MERCHANT)
+  logoUrl      String?     @db.LongText
   website      String?
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  // SaaS Subscription relation
+  subscription           GymSubscription?
+  subscriptionInvoices   GymSubscriptionInvoice[]
 
   // Tenant scoped relations
-  users                 User[]
-  members               Member[]
-  membershipPlans       MembershipPlan[]
-  memberships           Membership[]
-  paymentMethods        PaymentMethod[]
-  payments              Payment[]
-  invoices              Invoice[]
-  recurringBillings     RecurringBilling[]
-  reminders             Reminder[]
-  notificationTemplates NotificationTemplate[]
-  paymentProviders      PaymentProvider[]
-  billingPolicy         BillingPolicy?
-  integrationSettings   IntegrationSetting[]
-  auditLogs             AuditLog[]
+  users                  User[]
+  members                Member[]
+  membershipPlans        MembershipPlan[]
+  memberships            Membership[]
+  paymentMethods         PaymentMethod[]
+  payments               Payment[]
+  invoices               Invoice[]
+  recurringBillings      RecurringBilling[]
+  reminders              Reminder[]
+  notificationTemplates  NotificationTemplate[]
+  paymentProviders       PaymentProvider[]
+  billingPolicy          BillingPolicy?
+  integrationSettings    IntegrationSetting[]
+  auditLogs              AuditLog[]
+  platformFeeConfigs     PlatformFeeConfig[]
+  commissionTransactions CommissionTransaction[]
+  payoutRecords          PayoutRecord[]
 
   @@map("gyms")
 }
 
-/// Administrative User (Gym Owner / Administrator)
+/// SaaS Software Subscription Plans offered to Gyms
+model GymSubscriptionPlan {
+  id                   String            @id @default(uuid())
+  name                 String            // e.g. "Starter", "Growth", "Enterprise"
+  description          String?           @db.Text
+  monthlyPrice         Decimal           @db.Decimal(10, 2)
+  yearlyPrice          Decimal?          @db.Decimal(10, 2)
+  currency             String            @default("USD")
+  trialDays            Int               @default(14)
+  gracePeriodDays      Int               @default(7)
+  featureList          Json?             // Array of feature strings or limits
+  isActive             Boolean           @default(true)
+  stripeProductId      String?
+  stripeMonthlyPriceId String?
+  stripeYearlyPriceId  String?
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+
+  subscriptions        GymSubscription[]
+
+  @@map("gym_subscription_plans")
+}
+
+/// Gym Software Subscription (SaaS License)
+model GymSubscription {
+  id                   String                @id @default(uuid())
+  gymId                String                @unique
+  planId               String?
+  status               GymSubscriptionStatus @default(TRIALING)
+  price                Decimal               @default(0.00) @db.Decimal(10, 2)
+  currency             String                @default("USD")
+  billingInterval      String                @default("MONTHLY") // MONTHLY, YEARLY
+  currentPeriodStart   DateTime              @default(now())
+  currentPeriodEnd     DateTime
+  trialStart           DateTime?
+  trialEnd             DateTime?
+  gracePeriodEnd       DateTime?
+  cancelledAt          DateTime?
+  cancelAtPeriodEnd    Boolean               @default(false)
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+  stripePriceId        String?
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+
+  gym                  Gym                   @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  plan                 GymSubscriptionPlan?  @relation(fields: [planId], references: [id], onDelete: SetNull)
+  invoices             GymSubscriptionInvoice[]
+
+  @@index([status])
+  @@index([currentPeriodEnd])
+  @@map("gym_subscriptions")
+}
+
+/// Invoices and Receipts for Gym SaaS Software Subscriptions
+model GymSubscriptionInvoice {
+  id                    String        @id @default(uuid())
+  gymId                 String
+  subscriptionId        String
+  invoiceNumber         String        // e.g. SAAS-INV-2026-0001
+  amount                Decimal       @db.Decimal(10, 2)
+  currency              String        @default("USD")
+  status                PaymentStatus @default(PAID) // PENDING, PAID, FAILED, REFUNDED
+  billingPeriodStart    DateTime
+  billingPeriodEnd      DateTime
+  paidAt                DateTime?
+  stripePaymentIntentId String?
+  stripeInvoiceId       String?
+  failureReason         String?       @db.Text
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  gym                   Gym             @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  subscription          GymSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([gymId])
+  @@index([subscriptionId])
+  @@index([status])
+  @@map("gym_subscription_invoices")
+}
+
+/// Administrative User (Platform Super Admin or Gym Owner / Administrator)
 model User {
   id           String     @id @default(uuid())
-  gymId        String
+  gymId        String?
   name         String
   email        String
   passwordHash String
@@ -173,7 +292,7 @@ model User {
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
 
-  gym       Gym        @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  gym       Gym?       @relation(fields: [gymId], references: [id], onDelete: Cascade)
   auditLogs AuditLog[]
 
   @@unique([gymId, email])
@@ -222,6 +341,7 @@ model MembershipPlan {
   name             String // e.g. VIP Athlete, Elite Performance, Standard Fitness
   description      String?          @db.Text
   price            Decimal          @db.Decimal(10, 2)
+  currency         String           @default("USD")
   billingFrequency BillingFrequency @default(MONTHLY)
   featureList      Json? // Array of strings representing perks
   isActive         Boolean          @default(true)
@@ -244,6 +364,7 @@ model Membership {
   planId           String
   status           MembershipStatus @default(ACTIVE)
   price            Decimal          @db.Decimal(10, 2)
+  currency         String           @default("USD")
   billingFrequency BillingFrequency @default(MONTHLY)
   startDate        DateTime         @default(now())
   nextBillingDate  DateTime?
@@ -304,6 +425,7 @@ model Invoice {
   subtotal      Decimal       @db.Decimal(10, 2)
   tax           Decimal       @default(0.00) @db.Decimal(10, 2)
   total         Decimal       @db.Decimal(10, 2)
+  currency      String        @default("USD")
   dueDate       DateTime
   status        InvoiceStatus @default(OPEN)
   paidAt        DateTime?
@@ -316,6 +438,7 @@ model Invoice {
   membership Membership? @relation(fields: [membershipId], references: [id], onDelete: SetNull)
   payments   Payment[]
   reminders  Reminder[]
+  commissionTransactions CommissionTransaction[]
 
   @@unique([gymId, invoiceNumber])
   @@index([gymId])
@@ -352,6 +475,7 @@ model Payment {
   paymentMethod   PaymentMethod?   @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
   paymentAttempts PaymentAttempt[]
   reminders       Reminder[]
+  commissionTransactions CommissionTransaction[]
 
   @@index([gymId])
   @@index([memberId])
@@ -462,15 +586,20 @@ model NotificationTemplate {
 
 /// Payment Provider Credentials Reference (No raw secrets)
 model PaymentProvider {
-  id                String         @id @default(uuid())
-  gymId             String
-  provider          String // e.g. STRIPE, AUTHORIZE_NET
-  status            ProviderStatus @default(DISCONNECTED)
-  merchantAccountId String?
-  environment       String         @default("sandbox") // sandbox or production
-  config            Json? // Safe public keys, webhooks, merchant refs
-  createdAt         DateTime       @default(now())
-  updatedAt         DateTime       @updatedAt
+  id                  String         @id @default(uuid())
+  gymId               String
+  provider            String // e.g. STRIPE, AUTHORIZE_NET
+  status              ProviderStatus @default(DISCONNECTED)
+  merchantAccountId   String?
+  environment         String         @default("sandbox") // sandbox or production
+  config              Json? // Safe public keys, webhooks, merchant refs
+  stripeAccountId     String? // acct_xxxx for Connect
+  stripeAccountStatus String? // pending, active, restricted
+  chargesEnabled      Boolean        @default(false)
+  payoutsEnabled      Boolean        @default(false)
+  detailsSubmitted    Boolean        @default(false)
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
 
   gym Gym @relation(fields: [gymId], references: [id], onDelete: Cascade)
 
@@ -516,7 +645,7 @@ model IntegrationSetting {
 /// Audit Trail for Financial & Administrative Actions
 model AuditLog {
   id        String   @id @default(uuid())
-  gymId     String
+  gymId     String?
   userId    String?
   action    String // e.g. MEMBER_ENROLLED, PAYMENT_SETTLED, REMINDER_SENT
   entity    String // e.g. Member, Payment, Invoice, BillingPolicy
@@ -524,7 +653,7 @@ model AuditLog {
   metadata  Json?
   createdAt DateTime @default(now())
 
-  gym  Gym   @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  gym  Gym?  @relation(fields: [gymId], references: [id], onDelete: Cascade)
   user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   @@index([gymId])
@@ -532,3 +661,73 @@ model AuditLog {
   @@index([createdAt])
   @@map("audit_logs")
 }
+
+/// Platform Fee Configuration per Gym
+model PlatformFeeConfig {
+  id         String   @id @default(uuid())
+  gymId      String
+  percentage Decimal  @default(0.00) @db.Decimal(5, 2)
+  fixedFee   Decimal  @default(0.00) @db.Decimal(10, 2)
+  feeMode    String   @default("PERCENTAGE") // PERCENTAGE, FIXED, HYBRID
+  currency   String   @default("USD")
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  gym Gym @relation(fields: [gymId], references: [id], onDelete: Cascade)
+
+  @@index([gymId])
+  @@map("platform_fee_configs")
+}
+
+/// Immutable Financial Ledger for Platform Commission
+model CommissionTransaction {
+  id                    String           @id @default(uuid())
+  gymId                 String
+  paymentId             String?
+  invoiceId             String?
+  grossAmount           Decimal          @db.Decimal(10, 2)
+  platformFee           Decimal          @db.Decimal(10, 2)
+  processingFee         Decimal          @default(0.00) @db.Decimal(10, 2)
+  gymNetAmount          Decimal          @db.Decimal(10, 2)
+  currency              String           @default("USD")
+  status                CommissionStatus @default(PENDING)
+  stripePaymentIntentId String?
+  stripeTransferId      String?
+  stripeChargeId        String?
+  metadata              Json?
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
+
+  gym     Gym      @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  payment Payment? @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  invoice Invoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+
+  @@index([gymId])
+  @@index([paymentId])
+  @@index([status])
+  @@map("commission_transactions")
+}
+
+/// Gym Payout / Settlement Tracking
+model PayoutRecord {
+  id              String       @id @default(uuid())
+  gymId           String
+  stripePayoutId  String?
+  stripeAccountId String?
+  amount          Decimal      @db.Decimal(10, 2)
+  currency        String       @default("USD")
+  status          PayoutStatus @default(PENDING)
+  arrivalDate     DateTime?
+  failureReason   String?      @db.Text
+  metadata        Json?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  gym Gym @relation(fields: [gymId], references: [id], onDelete: Cascade)
+
+  @@index([gymId])
+  @@index([status])
+  @@map("payout_records")
+}
+

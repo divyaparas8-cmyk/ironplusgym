@@ -1,5 +1,5 @@
 const VALID_REMINDER_TYPES = ['UPCOMING_PAYMENT', 'PAYMENT_FAILED', 'OVERDUE', 'MEMBERSHIP_EXPIRY'];
-const VALID_REMINDER_CHANNELS = ['EMAIL', 'SMS', 'WHATSAPP'];
+const VALID_REMINDER_CHANNELS = ['EMAIL', 'SMS', 'WHATSAPP', 'EMAIL_AND_SMS'];
 const VALID_REMINDER_STATUSES = ['PENDING', 'SENT', 'DELIVERED', 'FAILED'];
 const ALLOWED_SORT_FIELDS = ['createdAt', 'scheduledAt', 'sentAt', 'status', 'type', 'channel'];
 
@@ -120,8 +120,15 @@ export const validateCreateReminder = (data = {}) => {
     }
   }
 
-  // Channel (optional, default EMAIL)
-  if (data.channel) {
+  // Channel (optional, default EMAIL) or Channels array
+  if (data.channels && Array.isArray(data.channels)) {
+    for (const ch of data.channels) {
+      if (!['EMAIL', 'SMS', 'WHATSAPP'].includes(String(ch).toUpperCase())) {
+        errors.push('Each channel in channels must be one of: EMAIL, SMS, WHATSAPP');
+        break;
+      }
+    }
+  } else if (data.channel) {
     const channelUpper = String(data.channel).toUpperCase();
     if (!VALID_REMINDER_CHANNELS.includes(channelUpper)) {
       errors.push(`channel must be one of: ${VALID_REMINDER_CHANNELS.join(', ')}`);

@@ -241,6 +241,12 @@ class InvoiceService {
     const tax = data.tax !== undefined ? Number(data.tax) : 0.00;
     const total = Number(data.total);
 
+    const gymRecord = await prisma.gym.findUnique({
+      where: { id: gymId },
+      select: { currency: true }
+    });
+    const invoiceCurrency = (data.currency || gymRecord?.currency || 'USD').toUpperCase();
+
     const invoice = await prisma.invoice.create({
       data: {
         gymId,
@@ -250,6 +256,7 @@ class InvoiceService {
         subtotal,
         tax,
         total,
+        currency: invoiceCurrency,
         dueDate: new Date(data.dueDate),
         status: data.status || 'OPEN',
         paidAt: data.status === 'PAID' ? new Date() : null,

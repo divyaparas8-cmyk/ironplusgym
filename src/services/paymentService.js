@@ -1,5 +1,6 @@
 import prisma from '../prisma.js';
 import paymentGateway from './paymentGateway/paymentGateway.js';
+import CommissionService from './commissionService.js';
 
 class PaymentService {
   /**
@@ -79,6 +80,9 @@ class PaymentService {
               brand: true,
               last4: true
             }
+          },
+          commissionTransactions: {
+            take: 1
           }
         }
       }),
@@ -144,7 +148,8 @@ class PaymentService {
           orderBy: {
             attemptedAt: 'desc'
           }
-        }
+        },
+        commissionTransactions: true
       }
     });
 
@@ -226,6 +231,15 @@ class PaymentService {
     const initialStatus = data.status === 'FAILED' ? 'FAILED' : 'PENDING';
     const amount = Number(data.amount);
 
+    let paymentCurrency = data.currency ? data.currency.toUpperCase() : null;
+    if (!paymentCurrency) {
+      const gymRecord = await prisma.gym.findUnique({
+        where: { id: gymId },
+        select: { currency: true, paymentMode: true }
+      });
+      paymentCurrency = (gymRecord?.currency || 'USD').toUpperCase();
+    }
+
     const payment = await prisma.payment.create({
       data: {
         gymId,
@@ -236,7 +250,7 @@ class PaymentService {
         provider: data.provider || 'MANUAL',
         providerPaymentId: data.providerPaymentId || null,
         amount,
-        currency: data.currency ? data.currency.toUpperCase() : 'USD',
+        currency: paymentCurrency,
         status: initialStatus,
         paymentMethodType: data.paymentMethodType || 'CARD',
         failureReason: data.failureReason ? data.failureReason.trim() : null,
@@ -263,6 +277,168 @@ class PaymentService {
     });
 
     return payment;
+  }
+
+  /**
+   * Execute an electronic charge with automatic Connect / Direct-Merchant resolution
+   */
+  async executeCharge({
+    gymId,
+    memberId,
+    invoiceId,
+    membershipId,
+    paymentMethodId,
+    amount,
+    currency = 'USD',
+    description,
+    metadata = {}
+  }) {
+    const gym = await prisma.gym.findUnique({
+      where: { id: gymId },
+      include: {
+        paymentProviders: {
+          where: { provider: 'STRIPE' }
+        }
+      }
+    });
+
+    const isConnectMode = gym?.paymentMode === 'CONNECT_PLATFORM';
+    const provider = gym?.paymentProviders?.[0];
+    const connectedAccountId = (isConnectMode && provider?.stripeAccountId) ? provider.stripeAccountId : null;
+
+    let commission = { platformFee: 0, gymNetAmount: Number(amount) };
+    if (isConnectMode) {
+      commission = await CommissionService.calculatePlatformFee({
+        gymId,
+        grossAmount: Number(amount),
+        currency
+      });
+    }
+
+    // Resolve payment method
+    let paymentMethod = null;
+    if (paymentMethodId) {
+      paymentMethod = await prisma.paymentMethod.findFirst({
+        where: { id: paymentMethodId, gymId }
+      });
+    } else {
+      paymentMethod = await prisma.paymentMethod.findFirst({
+        where: { memberId, gymId, status: 'ACTIVE' },
+        orderBy: { isDefault: 'desc' }
+      });
+    }
+
+    const now = new Date();
+
+    // Create initial payment record (PENDING)
+    const payment = await prisma.payment.create({
+      data: {
+        gymId,
+        memberId,
+        membershipId: membershipId || null,
+        invoiceId: invoiceId || null,
+        paymentMethodId: paymentMethod?.id || null,
+        amount: Number(amount),
+        currency: currency.toUpperCase(),
+        status: 'PENDING',
+        paymentMethodType: paymentMethod?.type || 'CARD',
+        provider: 'STRIPE',
+        transactionDate: now
+      }
+    });
+
+    // Execute charge via Gateway
+    const chargeRes = await paymentGateway.createCharge({
+      amount: Number(amount),
+      currency,
+      paymentMethodType: paymentMethod?.type || 'CARD',
+      providerPaymentMethodId: paymentMethod?.providerPaymentMethodId,
+      customerId: memberId,
+      description: description || `IronPulse Charge - ${gym?.legalName || 'Gym'}`,
+      connectedAccountId,
+      applicationFeeAmount: isConnectMode ? commission.platformFee : null,
+      metadata: {
+        gymId,
+        paymentId: payment.id,
+        invoiceId: invoiceId || '',
+        ...metadata
+      }
+    });
+
+    if (chargeRes.status === 'PAID') {
+      await prisma.$transaction(async (tx) => {
+        await tx.payment.update({
+          where: { id: payment.id },
+          data: {
+            status: 'PAID',
+            settledDate: now,
+            providerPaymentId: chargeRes.providerPaymentId
+          }
+        });
+
+        if (invoiceId) {
+          await tx.invoice.update({
+            where: { id: invoiceId },
+            data: { status: 'PAID', paidAt: now }
+          });
+        }
+
+        if (isConnectMode && commission.platformFee >= 0) {
+          await CommissionService.recordCommissionTransaction({
+            tx,
+            gymId,
+            paymentId: payment.id,
+            invoiceId,
+            grossAmount: Number(amount),
+            platformFee: commission.platformFee,
+            gymNetAmount: commission.gymNetAmount,
+            currency,
+            status: 'COLLECTED',
+            stripePaymentIntentId: chargeRes.providerPaymentId,
+            stripeTransferId: chargeRes.transferId,
+            stripeChargeId: chargeRes.chargeId
+          });
+        }
+
+        await tx.auditLog.create({
+          data: {
+            gymId,
+            action: 'PAYMENT_CHARGED_SUCCESS',
+            entity: 'Payment',
+            entityId: payment.id,
+            metadata: {
+              amount: Number(amount),
+              currency,
+              paymentMode: isConnectMode ? 'CONNECT_PLATFORM' : 'DIRECT_MERCHANT',
+              platformFee: isConnectMode ? commission.platformFee : 0,
+              providerPaymentId: chargeRes.providerPaymentId
+            }
+          }
+        });
+      });
+
+      return {
+        success: true,
+        status: 'PAID',
+        paymentId: payment.id,
+        providerPaymentId: chargeRes.providerPaymentId
+      };
+    } else {
+      await prisma.payment.update({
+        where: { id: payment.id },
+        data: {
+          status: 'FAILED',
+          failureReason: chargeRes.failureReason || 'Card charge declined by gateway'
+        }
+      });
+
+      return {
+        success: false,
+        status: chargeRes.status,
+        paymentId: payment.id,
+        failureReason: chargeRes.failureReason
+      };
+    }
   }
 
   /**
@@ -330,18 +506,39 @@ class PaymentService {
         });
       }
 
+      // Log financial settlement in AuditLog
+      await tx.auditLog.create({
+        data: {
+          gymId,
+          action: 'PAYMENT_SETTLED',
+          entity: 'Payment',
+          entityId: paymentId,
+          metadata: {
+            amount: Number(existing.amount),
+            currency: existing.currency,
+            invoiceId: existing.invoiceId,
+            settlementReference: settlementReference || updatedPayment.providerPaymentId,
+            settledDate: now.toISOString()
+          }
+        }
+      });
+
       return updatedPayment;
     });
   }
 
   /**
-   * Refund an eligible paid payment while preserving original audit history
+   * Refund an eligible paid payment while preserving original audit history and synchronizing invoice and commission
    */
   async refundPayment({ gymId, paymentId, reason }) {
     const existing = await prisma.payment.findFirst({
       where: {
         id: paymentId,
         gymId
+      },
+      include: {
+        invoice: true,
+        commissionTransactions: true
       }
     });
 
@@ -363,12 +560,15 @@ class PaymentService {
       throw error;
     }
 
+    const isConnectPayment = existing.commissionTransactions && existing.commissionTransactions.length > 0;
+
     // If payment was settled via an external provider, invoke Gateway refund first
-    if (existing.providerPaymentId && !existing.providerPaymentId.startsWith('MANUAL-')) {
+    if (existing.providerPaymentId && !existing.providerPaymentId.startsWith('MANUAL-') && !existing.providerPaymentId.startsWith('CASH-')) {
       const gatewayRefund = await paymentGateway.refundPayment({
         providerPaymentId: existing.providerPaymentId,
         amount: existing.amount,
-        reason: reason || 'Manual refund processed by admin'
+        reason: reason || 'Manual refund processed by admin',
+        reverseTransfer: isConnectPayment
       });
 
       if (!gatewayRefund.success && gatewayRefund.configured) {
@@ -378,34 +578,255 @@ class PaymentService {
       }
     }
 
-    // Preserve original settlement history and append refund audit note to failureReason field
-    const refundStamp = `[REFUNDED ${new Date().toISOString()}] ${reason || 'Manual refund processed by admin'}`;
+    // Preserve original settlement history and append refund audit note
+    const now = new Date();
+    const refundStamp = `[REFUNDED ${now.toISOString()}] ${reason || 'Manual refund processed by admin'}`;
     const preservedHistory = existing.failureReason
       ? `${existing.failureReason} | ${refundStamp}`
       : refundStamp;
 
-    const refunded = await prisma.payment.update({
-      where: { id: paymentId },
-      data: {
-        status: 'REFUNDED',
-        failureReason: preservedHistory
-      },
-      include: {
-        member: {
-          select: {
-            id: true,
-            memberId: true,
-            firstName: true,
-            lastName: true,
-            email: true
-          }
+    return await prisma.$transaction(async (tx) => {
+      // 1. Update Payment status to REFUNDED
+      const refundedPayment = await tx.payment.update({
+        where: { id: paymentId },
+        data: {
+          status: 'REFUNDED',
+          failureReason: preservedHistory
         },
-        invoice: true
+        include: {
+          member: {
+            select: {
+              id: true,
+              memberId: true,
+              firstName: true,
+              lastName: true,
+              email: true
+            }
+          },
+          invoice: true
+        }
+      });
+
+      // 2. Synchronize linked Invoice: transition to VOID with audit notes
+      if (existing.invoiceId) {
+        const invNotes = existing.invoice?.notes
+          ? `${existing.invoice.notes} | ${refundStamp}`
+          : refundStamp;
+
+        await tx.invoice.update({
+          where: { id: existing.invoiceId },
+          data: {
+            status: 'VOID',
+            notes: invNotes
+          }
+        });
       }
+
+      // 3. Update Commission ledger status to REFUNDED if applicable
+      if (isConnectPayment) {
+        await tx.commissionTransaction.updateMany({
+          where: { paymentId },
+          data: { status: 'REFUNDED' }
+        });
+      }
+
+      // 4. Record financial mutation in AuditLog
+      await tx.auditLog.create({
+        data: {
+          gymId,
+          action: 'PAYMENT_REFUNDED',
+          entity: 'Payment',
+          entityId: paymentId,
+          metadata: {
+            amount: Number(existing.amount),
+            currency: existing.currency,
+            invoiceId: existing.invoiceId,
+            reason: reason || 'Manual refund processed by admin',
+            refundedAt: now.toISOString()
+          }
+        }
+      });
+
+      return refundedPayment;
+    });
+  }
+
+  /**
+   * Record Member Payment (CASH or QR CODE)
+   * Atomic direct settlement: Updates payment status to PAID, synchronizes linked invoice to PAID,
+   * creates payment attempt and immutable audit log. Does NOT invoke external Stripe gateway.
+   */
+  async recordMemberPayment({
+    gymId,
+    userId,
+    memberId,
+    invoiceId,
+    membershipId,
+    amount,
+    paymentMethodType = 'CASH',
+    settlementReference,
+    notes
+  }) {
+    const numAmount = Number(amount);
+    if (isNaN(numAmount) || numAmount <= 0) {
+      const error = new Error('Amount must be a positive number greater than 0');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    // 1. Verify Member exists and belongs strictly to authenticated gym
+    const member = await prisma.member.findFirst({
+      where: { id: memberId, gymId }
     });
 
-    return refunded;
+    if (!member) {
+      const error = new Error('Member not found in the authenticated gym');
+      error.statusCode = 404;
+      throw error;
+    }
+
+    // 2. If invoiceId provided, verify it belongs strictly to authenticated gym
+    let invoice = null;
+    if (invoiceId) {
+      invoice = await prisma.invoice.findFirst({
+        where: { id: invoiceId, gymId }
+      });
+
+      if (!invoice) {
+        const error = new Error('Invoice not found in the authenticated gym');
+        error.statusCode = 404;
+        throw error;
+      }
+    }
+
+    // 3. If membershipId provided, verify it belongs strictly to authenticated gym
+    if (membershipId) {
+      const membership = await prisma.membership.findFirst({
+        where: { id: membershipId, gymId }
+      });
+
+      if (!membership) {
+        const error = new Error('Membership not found in the authenticated gym');
+        error.statusCode = 404;
+        throw error;
+      }
+    }
+
+    const gymRecord = await prisma.gym.findUnique({
+      where: { id: gymId },
+      select: { currency: true, legalName: true }
+    });
+
+    const paymentCurrency = (gymRecord?.currency || 'USD').toUpperCase();
+    const cleanMethod = String(paymentMethodType || 'CASH').toUpperCase();
+    const isQr = cleanMethod === 'QR' || cleanMethod === 'QR_CODE';
+    const isCash = cleanMethod === 'CASH';
+
+    const now = new Date();
+    const refCode = settlementReference
+      ? String(settlementReference).trim()
+      : `${isQr ? 'QR' : (isCash ? 'CASH' : 'COUNTER')}-${now.getTime()}`;
+
+    const adminNote = isQr
+      ? `QR Payment [Admin Confirmed]${notes ? ` | Notes: ${notes}` : ''}`
+      : `Cash Payment [In-Person Counter]${notes ? ` | Notes: ${notes}` : ''}`;
+
+    // Execute atomic settlement in Prisma Transaction
+    return await prisma.$transaction(async (tx) => {
+      // A. Create settled Payment Record
+      const payment = await tx.payment.create({
+        data: {
+          gymId,
+          memberId,
+          membershipId: membershipId || invoice?.membershipId || null,
+          invoiceId: invoiceId || null,
+          amount: Number(amount),
+          currency: paymentCurrency,
+          status: 'PAID',
+          paymentMethodType: isCash ? 'CASH' : 'POS',
+          provider: isQr ? 'QR_CODE' : 'CASH',
+          providerPaymentId: refCode,
+          failureReason: adminNote,
+          transactionDate: now,
+          settledDate: now
+        },
+        include: {
+          member: {
+            select: {
+              id: true,
+              memberId: true,
+              firstName: true,
+              lastName: true,
+              email: true
+            }
+          },
+          invoice: {
+            select: {
+              id: true,
+              invoiceNumber: true,
+              total: true,
+              status: true
+            }
+          }
+        }
+      });
+
+      // B. If invoice exists, transition invoice to PAID
+      if (invoiceId) {
+        const invNoteStamp = `[PAID ${now.toISOString()}] Settled via ${isQr ? 'QR Code' : 'Cash'} (Ref: ${refCode})`;
+        const updatedNotes = invoice.notes
+          ? `${invoice.notes} | ${invNoteStamp}`
+          : invNoteStamp;
+
+        await tx.invoice.update({
+          where: { id: invoiceId },
+          data: {
+            status: 'PAID',
+            paidAt: now,
+            notes: updatedNotes
+          }
+        });
+      }
+
+      // C. Record PaymentAttempt as SUCCESS
+      await tx.paymentAttempt.create({
+        data: {
+          paymentId: payment.id,
+          attemptNumber: 1,
+          status: 'SUCCESS',
+          attemptedAt: now,
+          providerResponse: {
+            method: isQr ? 'QR_CODE' : 'CASH',
+            recordedByUserId: userId || null,
+            reference: refCode,
+            confirmedAt: now.toISOString()
+          }
+        }
+      });
+
+      // D. Record Compliance in AuditLog
+      await tx.auditLog.create({
+        data: {
+          gymId,
+          userId: userId || null,
+          action: isQr ? 'MEMBER_QR_PAYMENT_RECORDED' : 'MEMBER_CASH_PAYMENT_RECORDED',
+          entity: 'Payment',
+          entityId: payment.id,
+          metadata: {
+            amount: Number(amount),
+            currency: paymentCurrency,
+            paymentMethod: isQr ? 'QR' : 'CASH',
+            invoiceId: invoiceId || null,
+            memberId,
+            reference: refCode
+          }
+        }
+      });
+
+      return payment;
+    });
   }
 }
 
 export default new PaymentService();
+

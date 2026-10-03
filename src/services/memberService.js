@@ -1,5 +1,6 @@
 import prisma from '../prisma.js';
 import auditLogService from './auditLogService.js';
+import paymentGateway from './paymentGateway/paymentGateway.js';
 
 export class MemberService {
   /**
@@ -67,6 +68,20 @@ export class MemberService {
         [sortBy]: sortOrder
       },
       include: {
+        paymentMethods: {
+          where: { status: 'ACTIVE' },
+          take: 1
+        },
+        payments: {
+          take: 1,
+          orderBy: { transactionDate: 'desc' },
+          select: {
+            id: true,
+            amount: true,
+            status: true,
+            paymentMethodType: true
+          }
+        },
         memberships: {
           where: { status: 'ACTIVE' },
           take: 1,
@@ -245,11 +260,17 @@ export class MemberService {
       plan = await prisma.membershipPlan.findFirst({
         where: { id: data.planId, gymId }
       });
-      if (!plan) {
-        const error = new Error('Selected membership plan not found');
-        error.statusCode = 404;
-        throw error;
-      }
+    }
+    if (!plan && data.membershipPlan) {
+      plan = await prisma.membershipPlan.findFirst({
+        where: { name: data.membershipPlan, gymId }
+      });
+    }
+    if (!plan) {
+      plan = await prisma.membershipPlan.findFirst({
+        where: { gymId, isActive: true },
+        orderBy: { createdAt: 'asc' }
+      });
     }
 
     return await prisma.$transaction(async (tx) => {
@@ -276,7 +297,7 @@ export class MemberService {
       let recurringBilling = null;
       let paymentMethod = null;
 
-      // 2. Create PaymentMethod if electronic details provided
+      // 2. Create PaymentMethod (Electronic or Cash/POS)
       const rawMethod = data.paymentMethod ? String(data.paymentMethod).toUpperCase() : 'CARD';
       const isElectronic = !['CASH', 'POS'].includes(rawMethod);
       if (isElectronic) {
@@ -295,10 +316,33 @@ export class MemberService {
             status: 'ACTIVE'
           }
         });
+      } else {
+        paymentMethod = await tx.paymentMethod.create({
+          data: {
+            gymId,
+            memberId: member.id,
+            provider: 'MANUAL',
+            providerPaymentMethodId: null,
+            type: rawMethod === 'POS' ? 'POS' : 'CASH',
+            brand: rawMethod === 'POS' ? 'Terminal POS' : 'Cash',
+            last4: null,
+            expMonth: null,
+            expYear: null,
+            isDefault: true,
+            status: 'ACTIVE'
+          }
+        });
       }
 
       // 3. Create Membership if plan selected
+      let paymentRecord = null;
       if (plan) {
+        const gymRecord = await tx.gym.findUnique({
+          where: { id: gymId },
+          select: { currency: true }
+        });
+        const gymCurrency = (gymRecord?.currency || 'USD').toUpperCase();
+
         const price = data.recurringAmount !== undefined ? Number(data.recurringAmount) : (data.monthlyFee !== undefined ? Number(data.monthlyFee) : Number(plan.price));
         const freqMap = {
           'MONTHLY': 'MONTHLY',
@@ -326,6 +370,7 @@ export class MemberService {
             memberId: member.id,
             planId: plan.id,
             price,
+            currency: gymCurrency,
             billingFrequency,
             startDate,
             nextBillingDate,
@@ -341,6 +386,10 @@ export class MemberService {
         const randSuffix = Math.floor(1000 + Math.random() * 9000);
         const invoiceNumber = `INV-${year}-${randSuffix}-${Date.now().toString().slice(-4)}`;
 
+        const isCashOrManual = ['CASH', 'POS'].includes(rawMethod);
+        const invoiceStatus = isCashOrManual ? 'PAID' : 'OPEN';
+        const paidAt = isCashOrManual ? new Date() : null;
+
         invoice = await tx.invoice.create({
           data: {
             gymId,
@@ -350,20 +399,73 @@ export class MemberService {
             subtotal,
             tax,
             total,
+            currency: gymCurrency,
             dueDate: startDate,
-            status: 'OPEN',
-            notes: `Initial registration invoice for ${plan.name} (${billingFrequency})`
+            status: invoiceStatus,
+            paidAt,
+            notes: `Initial registration invoice for ${plan.name} (${billingFrequency})${isCashOrManual ? ' - Paid via Cash (Front Desk)' : ''}`
           }
         });
 
-        // 5. Create RecurringBilling schedule
+        // 5. If Cash or POS, record settled Payment transaction in ledger immediately
+        if (isCashOrManual) {
+          paymentRecord = await tx.payment.create({
+            data: {
+              gymId,
+              memberId: member.id,
+              membershipId: membership.id,
+              invoiceId: invoice.id,
+              paymentMethodId: paymentMethod ? paymentMethod.id : null,
+              amount: total,
+              currency: gymCurrency,
+              status: 'PAID',
+              paymentMethodType: rawMethod === 'POS' ? 'POS' : 'CASH',
+              provider: rawMethod === 'POS' ? 'POS' : 'CASH',
+              providerPaymentId: `${rawMethod}-${Date.now()}`,
+              transactionDate: startDate,
+              settledDate: new Date(),
+              failureReason: null
+            }
+          });
+        } else if (data.providerPaymentIntentId || data.paymentIntentId) {
+          // Card payment verified and confirmed through Stripe Elements
+          const piId = data.providerPaymentIntentId || data.paymentIntentId;
+          paymentRecord = await tx.payment.create({
+            data: {
+              gymId,
+              memberId: member.id,
+              membershipId: membership.id,
+              invoiceId: invoice.id,
+              paymentMethodId: paymentMethod ? paymentMethod.id : null,
+              amount: total,
+              currency: gymCurrency,
+              status: 'PAID',
+              paymentMethodType: 'CARD',
+              provider: 'STRIPE',
+              providerPaymentId: piId,
+              transactionDate: startDate,
+              settledDate: new Date(),
+              failureReason: null
+            }
+          });
+          await tx.invoice.update({
+            where: { id: invoice.id },
+            data: {
+              status: 'PAID',
+              paidAt: new Date(),
+              notes: `Initial registration invoice for ${plan.name} (${billingFrequency}) - Settled via Stripe Card (${piId})`
+            }
+          });
+        }
+
+        // 6. Create RecurringBilling schedule
         recurringBilling = await tx.recurringBilling.create({
           data: {
             gymId,
             memberId: member.id,
             membershipId: membership.id,
             amount: total,
-            currency: 'USD',
+            currency: gymCurrency,
             billingFrequency,
             nextBillingDate,
             status: 'ACTIVE'
@@ -384,6 +486,8 @@ export class MemberService {
             planId: plan?.id,
             membershipId: membership?.id,
             invoiceId: invoice?.id,
+            paymentId: paymentRecord?.id || null,
+            paymentMethodType: rawMethod,
             hasPaymentMethod: Boolean(paymentMethod)
           }
         }
@@ -394,6 +498,7 @@ export class MemberService {
         membership,
         paymentMethod,
         invoice,
+        payment: paymentRecord,
         recurringBilling
       };
     });

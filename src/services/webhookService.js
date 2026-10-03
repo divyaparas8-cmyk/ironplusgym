@@ -68,6 +68,16 @@ class WebhookService {
       rawType === 'subscription.cancelled'
     ) {
       normalizedType = 'SUBSCRIPTION_CANCELLED';
+    } else if (rawType === 'account.updated') {
+      normalizedType = 'ACCOUNT_UPDATED';
+    } else if (rawType === 'payout.paid' || rawType === 'payout.succeeded') {
+      normalizedType = 'PAYOUT_PAID';
+    } else if (rawType === 'payout.failed') {
+      normalizedType = 'PAYOUT_FAILED';
+    } else if (rawType === 'payout.created') {
+      normalizedType = 'PAYOUT_CREATED';
+    } else if (rawType === 'transfer.created') {
+      normalizedType = 'TRANSFER_CREATED';
     }
 
     // Extract resource references
@@ -75,6 +85,9 @@ class WebhookService {
       dataObject.id?.startsWith('ch_') || dataObject.id?.startsWith('pi_')
         ? dataObject.id
         : dataObject.payment_intent || dataObject.providerPaymentId || null;
+
+    const stripeAccountId =
+      rawEvent.account || dataObject.account || (dataObject.id?.startsWith('acct_') ? dataObject.id : null);
 
     const internalPaymentId =
       dataObject.metadata?.paymentId || dataObject.paymentId || null;
@@ -98,17 +111,18 @@ class WebhookService {
 
     const amount =
       typeof dataObject.amount === 'number'
-        ? (rawType.startsWith('payment_intent') || rawType.startsWith('charge')
+        ? (rawType.startsWith('payment_intent') || rawType.startsWith('charge') || rawType.startsWith('payout') || rawType.startsWith('transfer')
             ? dataObject.amount / 100
             : dataObject.amount)
         : Number(dataObject.amount || 0);
 
     const currency = (dataObject.currency || 'USD').toUpperCase();
 
+    const failureCode = dataObject.last_payment_error?.code || dataObject.failure_code || null;
     const failureReason =
       dataObject.last_payment_error?.message ||
-      dataObject.failureReason ||
       dataObject.failure_message ||
+      dataObject.failureReason ||
       'Provider payment failed';
 
     const refundReason =
@@ -116,11 +130,17 @@ class WebhookService {
       dataObject.refundReason ||
       'Customer refund processed';
 
+    const status = dataObject.charges_enabled && dataObject.payouts_enabled ? 'ACTIVE' : (dataObject.details_submitted ? 'ONBOARDING' : 'RESTRICTED');
+
     return {
       id: eventId,
       rawType,
       type: normalizedType,
+      eventType: normalizedType,
       provider,
+      stripeAccountId,
+      accountId: stripeAccountId,
+      status,
       providerPaymentId,
       internalPaymentId,
       providerSubscriptionId,
@@ -128,10 +148,20 @@ class WebhookService {
       invoiceId,
       amount,
       currency,
+      chargesEnabled: Boolean(dataObject.charges_enabled),
+      payoutsEnabled: Boolean(dataObject.payouts_enabled),
+      detailsSubmitted: Boolean(dataObject.details_submitted),
+      transferId: dataObject.id?.startsWith('tr_') ? dataObject.id : (dataObject.transfer || null),
+      payoutId: dataObject.id?.startsWith('po_') ? dataObject.id : null,
+      failureCode,
       failureReason,
       refundReason,
       timestamp: rawEvent.created ? new Date(rawEvent.created * 1000) : new Date()
     };
+  }
+
+  normalizeWebhookEvent(provider, rawEvent) {
+    return this.normalizeEvent({ ...rawEvent, provider: provider || 'STRIPE' });
   }
 }
 

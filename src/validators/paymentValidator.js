@@ -1,5 +1,5 @@
 const VALID_PAYMENT_STATUSES = ['PENDING', 'PAID', 'FAILED', 'REFUNDED', 'OVERDUE'];
-const VALID_PAYMENT_METHOD_TYPES = ['CARD', 'ACH', 'CASH', 'POS'];
+const VALID_PAYMENT_METHOD_TYPES = ['CARD', 'ACH', 'CASH', 'POS', 'QR', 'QR_CODE', 'STRIPE'];
 const ALLOWED_SORT_FIELDS = ['transactionDate', 'settledDate', 'amount', 'status', 'createdAt'];
 
 /**
@@ -226,3 +226,52 @@ export const validateRefund = (data = {}) => {
     errors
   };
 };
+
+/**
+ * Validate payload for POST /api/payments/record (Direct Member Cash or QR Payment)
+ */
+export const validateRecordMemberPayment = (data = {}) => {
+  const errors = [];
+
+  if (!data.memberId || typeof data.memberId !== 'string' || !data.memberId.trim()) {
+    errors.push('memberId is required and must be a valid string');
+  }
+
+  if (data.amount === undefined || data.amount === null) {
+    errors.push('amount is required');
+  } else {
+    const amountNum = Number(data.amount);
+    if (isNaN(amountNum) || amountNum <= 0) {
+      errors.push('amount must be a positive number greater than 0');
+    }
+  }
+
+  const method = String(data.paymentMethod || data.paymentMethodType || 'CASH').toUpperCase();
+  const allowedDirectMethods = ['CASH', 'QR', 'QR_CODE', 'POS', 'CARD'];
+  if (!allowedDirectMethods.includes(method)) {
+    errors.push(`paymentMethod must be one of: ${allowedDirectMethods.join(', ')}`);
+  }
+
+  if (data.invoiceId !== undefined && data.invoiceId !== null && (typeof data.invoiceId !== 'string' || !data.invoiceId.trim())) {
+    errors.push('invoiceId must be a valid string if provided');
+  }
+
+  if (data.membershipId !== undefined && data.membershipId !== null && (typeof data.membershipId !== 'string' || !data.membershipId.trim())) {
+    errors.push('membershipId must be a valid string if provided');
+  }
+
+  return {
+    isValid: errors.length === 0,
+    errors,
+    sanitized: {
+      memberId: data.memberId ? String(data.memberId).trim() : null,
+      invoiceId: data.invoiceId ? String(data.invoiceId).trim() : null,
+      membershipId: data.membershipId ? String(data.membershipId).trim() : null,
+      amount: Number(data.amount) || 0,
+      paymentMethodType: method,
+      settlementReference: data.settlementReference ? String(data.settlementReference).trim() : null,
+      notes: data.notes ? String(data.notes).trim() : null
+    }
+  };
+};
+

@@ -125,6 +125,13 @@ export const updateGymSettings = async (req, res) => {
       }
     });
 
+    if (currency !== undefined) {
+      await prisma.billingPolicy.updateMany({
+        where: { gymId },
+        data: { currency }
+      });
+    }
+
     return res.status(200).json({
       success: true,
       message: 'Gym profile updated successfully',
@@ -151,8 +158,11 @@ export const forgotPassword = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Email address is required' });
     }
 
-    const result = await AuthService.requestPasswordReset(email);
-    return res.status(200).json(result);
+    await AuthService.requestPasswordReset(email);
+    return res.status(200).json({
+      success: true,
+      message: 'If an account exists, reset instructions have been sent.'
+    });
   } catch (error) {
     return res.status(500).json({
       success: false,

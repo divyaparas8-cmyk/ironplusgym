@@ -91,6 +91,11 @@ export const dashboardService = {
       momMemberGrowth = 100.0;
     }
 
+    const gym = await prisma.gym.findUnique({
+      where: { id: gymId },
+      select: { currency: true }
+    });
+
     return {
       metrics: {
         totalMembers,
@@ -103,7 +108,8 @@ export const dashboardService = {
         collectedThisMonth: currCollected,
         collectedCountThisMonth: collectedAgg._count.id || 0,
         momRevenueGrowth,
-        momMemberGrowth
+        momMemberGrowth,
+        currency: gym?.currency || 'USD'
       }
     };
   },

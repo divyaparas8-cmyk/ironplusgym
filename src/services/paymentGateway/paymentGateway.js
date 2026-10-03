@@ -183,6 +183,8 @@ class PaymentGateway {
     providerPaymentMethodId,
     customerId,
     description,
+    connectedAccountId,
+    applicationFeeAmount,
     metadata = {}
   }) {
     const amountInCents = Math.round(Number(amount) * 100);
@@ -217,6 +219,14 @@ class PaymentGateway {
       payload['payment_method_types[0]'] = 'us_bank_account';
     }
 
+    // Stripe Connect: Destination Charges & Application Fee
+    if (connectedAccountId && !connectedAccountId.startsWith('acct_unconfigured')) {
+      payload['transfer_data[destination]'] = connectedAccountId;
+      if (applicationFeeAmount !== undefined && applicationFeeAmount !== null && Number(applicationFeeAmount) >= 0) {
+        payload.application_fee_amount = String(Math.round(Number(applicationFeeAmount) * 100));
+      }
+    }
+
     Object.entries(metadata).forEach(([k, v]) => {
       payload[`metadata[${k}]`] = String(v);
     });
@@ -230,7 +240,9 @@ class PaymentGateway {
           configured: true,
           success: true,
           status: 'PAID',
-          providerPaymentId: pi.id
+          providerPaymentId: pi.id,
+          chargeId: pi.latest_charge || (pi.charges?.data?.[0]?.id) || null,
+          transferId: pi.transfer_data?.destination ? (pi.charges?.data?.[0]?.transfer || null) : null
         };
       }
       if (pi.status === 'processing' || pi.status === 'requires_action') {
@@ -263,7 +275,7 @@ class PaymentGateway {
   /**
    * Execute a refund through provider
    */
-  async refundPayment({ providerPaymentId, amount, reason }) {
+  async refundPayment({ providerPaymentId, amount, reason, reverseTransfer = false }) {
     if (!this.isConfigured()) {
       return {
         configured: false,
@@ -273,12 +285,12 @@ class PaymentGateway {
       };
     }
 
-    if (!providerPaymentId || providerPaymentId.startsWith('MANUAL-')) {
+    if (!providerPaymentId || providerPaymentId.startsWith('MANUAL-') || providerPaymentId.startsWith('CASH-')) {
       return {
         configured: true,
         success: true,
         status: 'REFUNDED',
-        note: 'Internal manual settlement refunded locally without provider call.'
+        note: 'Internal manual or cash settlement refunded locally without provider call.'
       };
     }
 
@@ -292,6 +304,10 @@ class PaymentGateway {
 
     if (reason) {
       payload['metadata[reason]'] = reason;
+    }
+
+    if (reverseTransfer) {
+      payload.reverse_transfer = 'true';
     }
 
     const res = await this._stripeRequest('/refunds', 'POST', payload);
@@ -323,6 +339,83 @@ class PaymentGateway {
   }
 
   /**
+   * Helper: Get publishable configuration for frontend client
+   */
+  getPublishableConfig() {
+    return {
+      configured: this.isConfigured(),
+      publishableKey: this.stripePublishableKey || process.env.STRIPE_PUBLISHABLE_KEY || null,
+      provider: 'STRIPE'
+    };
+  }
+
+  /**
+   * Create a PaymentIntent for frontend confirmation (Client-side Stripe Elements flow)
+   */
+  async createPaymentIntent({
+    amount,
+    currency = 'usd',
+    customerId,
+    description,
+    connectedAccountId,
+    applicationFeeAmount,
+    metadata = {}
+  }) {
+    if (!this.isConfigured()) {
+      return {
+        configured: false,
+        success: false,
+        status: 'CONFIGURATION_REQUIRED',
+        clientSecret: null,
+        error: 'Stripe credentials are not configured in environment.'
+      };
+    }
+
+    const amountInCents = Math.round(Number(amount) * 100);
+    const payload = {
+      amount: String(amountInCents),
+      currency: currency.toLowerCase(),
+      description: description || 'IronPulse Membership Enrollment Charge',
+      'payment_method_types[0]': 'card'
+    };
+
+    if (customerId && !customerId.startsWith('cus_unconfigured')) {
+      payload.customer = customerId;
+    }
+
+    // Stripe Connect: Destination Charges & Application Fee
+    if (connectedAccountId && !connectedAccountId.startsWith('acct_unconfigured')) {
+      payload['transfer_data[destination]'] = connectedAccountId;
+      if (applicationFeeAmount !== undefined && applicationFeeAmount !== null && Number(applicationFeeAmount) >= 0) {
+        payload.application_fee_amount = String(Math.round(Number(applicationFeeAmount) * 100));
+      }
+    }
+
+    Object.entries(metadata).forEach(([k, v]) => {
+      payload[`metadata[${k}]`] = String(v);
+    });
+
+    const res = await this._stripeRequest('/payment_intents', 'POST', payload);
+    if (res.success && res.data) {
+      return {
+        configured: true,
+        success: true,
+        clientSecret: res.data.client_secret,
+        paymentIntentId: res.data.id,
+        status: res.data.status
+      };
+    }
+
+    return {
+      configured: true,
+      success: false,
+      clientSecret: null,
+      status: 'FAILED',
+      error: res.error || 'Failed to create payment intent'
+    };
+  }
+
+  /**
    * Dunning retry charge helper
    */
   async retryPayment(params) {
@@ -330,6 +423,169 @@ class PaymentGateway {
       ...params,
       description: `Dunning Retry Attempt ${params.attemptNumber || 1}`
     });
+  }
+
+  // ===========================================================================
+  // STRIPE CONNECT METHODS (Marketplace & Connected Accounts)
+  // ===========================================================================
+
+  /**
+   * Create a Connected Express Account for a Gym Tenant
+   */
+  async createConnectedAccount({ email, country = 'US', businessType = 'company', companyName, gymId }) {
+    if (!this.isConfigured()) {
+      return {
+        configured: false,
+        success: false,
+        accountId: `acct_unconfigured_${Date.now()}`,
+        status: 'CONFIGURATION_REQUIRED',
+        error: 'Stripe Secret Key is not configured for Connect account creation.'
+      };
+    }
+
+    const payload = {
+      type: 'express',
+      country: country ? country.toUpperCase() : 'US',
+      email: email || '',
+      'capabilities[card_payments][requested]': 'true',
+      'capabilities[transfers][requested]': 'true',
+      'business_type': businessType === 'individual' ? 'individual' : 'company',
+      'metadata[gymId]': gymId || ''
+    };
+
+    if (companyName) {
+      payload['company[name]'] = companyName;
+    }
+
+    const res = await this._stripeRequest('/accounts', 'POST', payload);
+    if (res.success && res.data?.id) {
+      return {
+        configured: true,
+        success: true,
+        accountId: res.data.id,
+        chargesEnabled: res.data.charges_enabled || false,
+        payoutsEnabled: res.data.payouts_enabled || false,
+        detailsSubmitted: res.data.details_submitted || false,
+        status: 'ACTIVE'
+      };
+    }
+
+    return {
+      configured: true,
+      success: false,
+      accountId: null,
+      error: res.error || 'Failed to create Stripe connected account'
+    };
+  }
+
+  /**
+   * Generate an Account Link for Stripe Hosted Express Onboarding
+   */
+  async createAccountOnboardingLink({ accountId, refreshUrl, returnUrl }) {
+    if (!this.isConfigured()) {
+      return {
+        configured: false,
+        success: false,
+        url: null,
+        error: 'Stripe credentials not configured for onboarding link.'
+      };
+    }
+
+    const payload = {
+      account: accountId,
+      refresh_url: refreshUrl || 'http://localhost:5173/settings/gateway?connect=refresh',
+      return_url: returnUrl || 'http://localhost:5173/settings/gateway?connect=success',
+      type: 'account_onboarding'
+    };
+
+    const res = await this._stripeRequest('/account_links', 'POST', payload);
+    if (res.success && res.data?.url) {
+      return {
+        configured: true,
+        success: true,
+        url: res.data.url,
+        expiresAt: res.data.expires_at
+      };
+    }
+
+    return {
+      configured: true,
+      success: false,
+      url: null,
+      error: res.error || 'Failed to generate Stripe onboarding link'
+    };
+  }
+
+  /**
+   * Fetch live account capabilities and status from Stripe
+   */
+  async getConnectedAccountStatus(accountId) {
+    if (!this.isConfigured() || !accountId || accountId.startsWith('acct_unconfigured')) {
+      return {
+        configured: false,
+        chargesEnabled: false,
+        payoutsEnabled: false,
+        detailsSubmitted: false,
+        status: 'UNCONFIGURED'
+      };
+    }
+
+    const res = await this._stripeRequest(`/accounts/${accountId}`, 'GET');
+    if (res.success && res.data) {
+      const acc = res.data;
+      return {
+        configured: true,
+        success: true,
+        accountId: acc.id,
+        chargesEnabled: Boolean(acc.charges_enabled),
+        payoutsEnabled: Boolean(acc.payouts_enabled),
+        detailsSubmitted: Boolean(acc.details_submitted),
+        currentlyDue: acc.requirements?.currently_due || [],
+        eventuallyDue: acc.requirements?.eventually_due || [],
+        payoutSchedule: acc.settings?.payouts?.schedule || {},
+        status: acc.charges_enabled && acc.payouts_enabled ? 'CONNECTED' : (acc.details_submitted ? 'PENDING_VERIFICATION' : 'ONBOARDING_REQUIRED')
+      };
+    }
+
+    return {
+      configured: true,
+      success: false,
+      chargesEnabled: false,
+      payoutsEnabled: false,
+      detailsSubmitted: false,
+      status: 'ERROR',
+      error: res.error || 'Failed to fetch connected account status'
+    };
+  }
+
+  /**
+   * Generate an Express Login Link for a Gym to view their Stripe Express Dashboard
+   */
+  async createAccountLoginLink(accountId) {
+    if (!this.isConfigured() || !accountId || accountId.startsWith('acct_unconfigured')) {
+      return {
+        configured: false,
+        success: false,
+        url: null,
+        error: 'Stripe credentials or account not configured.'
+      };
+    }
+
+    const res = await this._stripeRequest(`/accounts/${accountId}/login_links`, 'POST');
+    if (res.success && res.data?.url) {
+      return {
+        configured: true,
+        success: true,
+        url: res.data.url
+      };
+    }
+
+    return {
+      configured: true,
+      success: false,
+      url: null,
+      error: res.error || 'Failed to generate Express dashboard login link'
+    };
   }
 }
 

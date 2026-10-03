@@ -58,13 +58,19 @@ export const reportService = {
     const netRevenue = Math.max(0, grossRevenue - refundTotal);
     const arpu = membersCount > 0 ? Math.round((netRevenue / membersCount) * 100) / 100 : 0;
 
+    const gym = await prisma.gym.findUnique({
+      where: { id: gymId },
+      select: { currency: true }
+    });
+
     return {
       summary: {
         grossRevenue,
         netRevenue,
         refundTotal,
         arpu,
-        activeMembers: membersCount
+        activeMembers: membersCount,
+        currency: gym?.currency || 'USD'
       }
     };
   },
@@ -128,12 +134,18 @@ export const reportService = {
       });
     }
 
+    const gym = await prisma.gym.findUnique({
+      where: { id: gymId },
+      select: { currency: true }
+    });
+
     return {
       summary: {
         grossRevenue,
         netRevenue,
         refundTotal,
-        transactionCount: paidAgg._count.id || 0
+        transactionCount: paidAgg._count.id || 0,
+        currency: gym?.currency || 'USD'
       },
       monthlySummary,
       chartData: monthlySummary
@@ -208,6 +220,66 @@ export const reportService = {
         successRate
       },
       declineReasons
+    };
+  },
+
+  async getCommissionReport(gymId, range = '30d') {
+    const startDate = this.getDateFilter(range);
+
+    const [commissionAgg, gym, transactions] = await Promise.all([
+      prisma.commissionTransaction.aggregate({
+        where: {
+          gymId,
+          createdAt: { gte: startDate }
+        },
+        _sum: {
+          grossAmount: true,
+          platformFee: true,
+          gymNetAmount: true
+        },
+        _count: { id: true }
+      }),
+      prisma.gym.findUnique({
+        where: { id: gymId },
+        select: { currency: true, paymentMode: true }
+      }),
+      prisma.commissionTransaction.findMany({
+        where: {
+          gymId,
+          createdAt: { gte: startDate }
+        },
+        take: 50,
+        orderBy: { createdAt: 'desc' },
+        include: {
+          payment: {
+            select: {
+              id: true,
+              status: true,
+              transactionDate: true,
+              member: { select: { firstName: true, lastName: true, email: true, memberId: true } }
+            }
+          }
+        }
+      })
+    ]);
+
+    const totalGross = Number(commissionAgg._sum.grossAmount || 0);
+    const totalPlatformCommission = Number(commissionAgg._sum.platformFee || 0);
+    const totalGymPayout = Number(commissionAgg._sum.gymNetAmount || 0);
+
+    return {
+      summary: {
+        totalGross,
+        totalPlatformCommission,
+        totalGymPayout,
+        grossTuition: totalGross,
+        platformFee: totalPlatformCommission,
+        gymNet: totalGymPayout,
+        transactionCount: commissionAgg._count.id || 0,
+        currency: gym?.currency || 'USD',
+        paymentMode: gym?.paymentMode || 'DIRECT_MERCHANT'
+      },
+      transactions
     };
   }
 };

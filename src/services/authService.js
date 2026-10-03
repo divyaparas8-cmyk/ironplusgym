@@ -1,6 +1,6 @@
 import bcrypt from 'bcryptjs';
 import prisma from '../prisma.js';
-import { generateToken } from '../utils/jwt.js';
+import { generateToken, getJwtSecret } from '../utils/jwt.js';
 
 export class AuthService {
   /**
@@ -70,21 +70,21 @@ export class AuthService {
     // Generate token with strictly needed claims
     const token = generateToken({
       userId: user.id,
-      gymId: user.gymId,
+      gymId: user.gymId || null,
       role: user.role
     });
 
     // Strip sensitive fields
     const safeUser = {
       id: user.id,
-      gymId: user.gymId,
+      gymId: user.gymId || null,
       name: user.name,
       email: user.email,
       role: user.role,
       status: user.status,
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,
-      gym: user.gym
+      gym: user.gym || null
     };
 
     return {
@@ -96,15 +96,17 @@ export class AuthService {
   /**
    * Fetch current authenticated user by verified identity
    * @param {string} userId
-   * @param {string} gymId
+   * @param {string|null} gymId
    * @returns {Object} safe user object
    */
   static async getCurrentUser(userId, gymId) {
+    const where = { id: userId };
+    if (gymId) {
+      where.gymId = gymId; // Enforce tenant isolation for gym users
+    }
+
     const user = await prisma.user.findFirst({
-      where: {
-        id: userId,
-        gymId: gymId // Enforce tenant isolation
-      },
+      where,
       select: {
         id: true,
         gymId: true,
@@ -129,7 +131,10 @@ export class AuthService {
             timezone: true,
             currency: true,
             logoUrl: true,
-            website: true
+            website: true,
+            subscription: {
+              include: { plan: true }
+            }
           }
         }
       }
@@ -174,7 +179,19 @@ export class AuthService {
 
     const passwordHash = await bcrypt.hash(password, 12);
 
-    // Create Gym + Owner User atomically
+    // Fetch default SaaS plan for trial provisioning
+    const defaultPlan = await prisma.gymSubscriptionPlan.findFirst({
+      where: { isActive: true },
+      orderBy: { monthlyPrice: 'asc' }
+    });
+
+    const now = new Date();
+    const trialDays = defaultPlan?.trialDays || 14;
+    const gracePeriodDays = defaultPlan?.gracePeriodDays || 7;
+    const trialEnd = new Date(now.getTime() + trialDays * 24 * 60 * 60 * 1000);
+    const gracePeriodEnd = new Date(trialEnd.getTime() + gracePeriodDays * 24 * 60 * 60 * 1000);
+
+    // Create Gym + Owner User + Initial SaaS Trial Subscription atomically
     const result = await prisma.$transaction(async (tx) => {
       const gym = await tx.gym.create({
         data: {
@@ -208,7 +225,23 @@ export class AuthService {
         }
       });
 
-      return { gym, user };
+      const subscription = await tx.gymSubscription.create({
+        data: {
+          gymId: gym.id,
+          planId: defaultPlan?.id || null,
+          status: 'TRIALING',
+          price: defaultPlan ? defaultPlan.monthlyPrice : 49.00,
+          currency: 'USD',
+          billingInterval: 'MONTHLY',
+          currentPeriodStart: now,
+          currentPeriodEnd: trialEnd,
+          trialStart: now,
+          trialEnd: trialEnd,
+          gracePeriodEnd: gracePeriodEnd
+        }
+      });
+
+      return { gym: { ...gym, subscription }, user };
     });
 
     const token = generateToken({
@@ -239,7 +272,8 @@ export class AuthService {
       return { success: true, message: 'If an account exists, reset instructions have been sent.' };
     }
 
-    const secret = (process.env.JWT_SECRET || 'ironpulse_super_secret_jwt_key_2026') + user.passwordHash;
+    const jwtSecret = getJwtSecret();
+    const secret = jwtSecret + user.passwordHash;
     const jwtModule = await import('jsonwebtoken');
     const resetToken = jwtModule.default.sign(
       { userId: user.id, email: user.email },
@@ -263,8 +297,7 @@ export class AuthService {
 
     return {
       success: true,
-      message: 'If an account exists, reset instructions have been sent.',
-      resetToken // Return token for dev / testing environments
+      message: 'If an account exists, reset instructions have been sent.'
     };
   }
 
@@ -295,7 +328,8 @@ export class AuthService {
       throw error;
     }
 
-    const secret = (process.env.JWT_SECRET || 'ironpulse_super_secret_jwt_key_2026') + user.passwordHash;
+    const jwtSecret = getJwtSecret();
+    const secret = jwtSecret + user.passwordHash;
     const jwtModule = await import('jsonwebtoken');
 
     try {

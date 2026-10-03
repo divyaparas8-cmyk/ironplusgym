@@ -1,6 +1,7 @@
 import prisma from '../prisma.js';
 import ReminderService from './reminderService.js';
 import paymentGateway from './paymentGateway/paymentGateway.js';
+import CommissionService from './commissionService.js';
 
 export class DunningService {
   /**
@@ -395,21 +396,50 @@ export class DunningService {
       ? await prisma.paymentMethod.findFirst({ where: { id: payment.paymentMethodId, gymId } })
       : (payment.member.paymentMethods[0] || null);
 
+    const gym = await prisma.gym.findUnique({
+      where: { id: gymId },
+      include: {
+        paymentProviders: {
+          where: { provider: 'STRIPE' }
+        }
+      }
+    });
+
+    const isConnectMode = gym?.paymentMode === 'CONNECT_PLATFORM';
+    const provider = gym?.paymentProviders?.[0];
+    const connectedAccountId = (isConnectMode && provider?.stripeAccountId) ? provider.stripeAccountId : null;
+
+    let commission = { platformFee: 0, gymNetAmount: Number(payment.amount) };
+    if (isConnectMode) {
+      commission = await CommissionService.calculatePlatformFee({
+        gymId,
+        grossAmount: Number(payment.amount),
+        currency: payment.currency
+      });
+    }
+
     const chargeRes = await paymentGateway.retryPayment({
       amount: payment.amount,
       currency: payment.currency,
       paymentMethodType: paymentMethod ? paymentMethod.type : 'CARD',
       providerPaymentMethodId: paymentMethod ? paymentMethod.providerPaymentMethodId : null,
       customerId: payment.memberId,
-      attemptNumber: nextAttemptNumber
+      attemptNumber: nextAttemptNumber,
+      connectedAccountId,
+      applicationFeeAmount: isConnectMode ? commission.platformFee : null,
+      metadata: {
+        gymId,
+        paymentId: payment.id,
+        invoiceId: payment.invoiceId || ''
+      }
     });
 
     const now = new Date();
 
     if (chargeRes.status === 'PAID') {
       // Successful retry: Restore financial health atomically
-      await prisma.$transaction([
-        prisma.paymentAttempt.create({
+      await prisma.$transaction(async (tx) => {
+        await tx.paymentAttempt.create({
           data: {
             paymentId: payment.id,
             attemptNumber: nextAttemptNumber,
@@ -417,37 +447,64 @@ export class DunningService {
             failureReason: null,
             providerResponse: { providerPaymentId: chargeRes.providerPaymentId, status: 'PAID' }
           }
-        }),
-        prisma.payment.update({
+        });
+
+        await tx.payment.update({
           where: { id: payment.id },
           data: { status: 'PAID', settledDate: now, providerPaymentId: chargeRes.providerPaymentId, failureReason: null }
-        }),
-        ...(payment.invoiceId ? [
-          prisma.invoice.update({
+        });
+
+        if (payment.invoiceId) {
+          await tx.invoice.update({
             where: { id: payment.invoiceId },
             data: { status: 'PAID', paidAt: now }
-          })
-        ] : []),
-        ...(payment.membershipId ? [
-          prisma.recurringBilling.updateMany({
+          });
+        }
+
+        if (payment.membershipId) {
+          await tx.recurringBilling.updateMany({
             where: { membershipId: payment.membershipId, gymId },
             data: { status: 'ACTIVE', retryCount: 0 }
-          })
-        ] : []),
-        prisma.member.update({
+          });
+        }
+
+        await tx.member.update({
           where: { id: payment.memberId },
           data: { status: 'ACTIVE' }
-        }),
-        prisma.auditLog.create({
+        });
+
+        if (isConnectMode && commission.platformFee >= 0) {
+          await CommissionService.recordCommissionTransaction({
+            tx,
+            gymId,
+            paymentId: payment.id,
+            invoiceId: payment.invoiceId,
+            grossAmount: Number(payment.amount),
+            platformFee: commission.platformFee,
+            gymNetAmount: commission.gymNetAmount,
+            currency: payment.currency,
+            status: 'COLLECTED',
+            stripePaymentIntentId: chargeRes.providerPaymentId,
+            stripeTransferId: chargeRes.transferId,
+            stripeChargeId: chargeRes.chargeId
+          });
+        }
+
+        await tx.auditLog.create({
           data: {
             gymId,
             action: 'DUNNING_RETRY_SUCCESS',
             entity: 'Payment',
             entityId: payment.id,
-            metadata: { attemptNumber: nextAttemptNumber, providerPaymentId: chargeRes.providerPaymentId }
+            metadata: {
+              attemptNumber: nextAttemptNumber,
+              providerPaymentId: chargeRes.providerPaymentId,
+              paymentMode: isConnectMode ? 'CONNECT_PLATFORM' : 'DIRECT_MERCHANT',
+              platformFee: isConnectMode ? commission.platformFee : 0
+            }
           }
-        })
-      ]);
+        });
+      });
 
       return { success: true, status: 'PAID', attemptNumber: nextAttemptNumber };
     } else {
@@ -477,12 +534,13 @@ export class DunningService {
             const inv = await tx.invoice.findUnique({ where: { id: payment.invoiceId } });
             if (inv && inv.status !== 'PAID' && !inv.notes?.includes('[LATE FEE APPLIED]')) {
               const newTotal = Number(inv.total) + policy.latePaymentFee;
+              const feeCurrency = inv.currency || policy.currency || 'USD';
               await tx.invoice.update({
                 where: { id: payment.invoiceId },
                 data: {
                   status: 'OVERDUE',
                   total: newTotal,
-                  notes: inv.notes ? `${inv.notes} | [LATE FEE APPLIED: $${policy.latePaymentFee.toFixed(2)}]` : `[LATE FEE APPLIED: $${policy.latePaymentFee.toFixed(2)}]`
+                  notes: inv.notes ? `${inv.notes} | [LATE FEE APPLIED: ${feeCurrency} ${policy.latePaymentFee.toFixed(2)}]` : `[LATE FEE APPLIED: ${feeCurrency} ${policy.latePaymentFee.toFixed(2)}]`
                 }
               });
             } else if (inv && inv.status !== 'PAID') {

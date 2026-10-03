@@ -95,6 +95,31 @@ class PaymentWebhookService {
       }
     }
 
+    // D. Locate GymSubscription if relevant
+    let gymSubscription = null;
+    if (!targetGymId && normalizedEvent.providerSubscriptionId) {
+      gymSubscription = await prisma.gymSubscription.findFirst({
+        where: {
+          stripeSubscriptionId: normalizedEvent.providerSubscriptionId
+        },
+        include: { plan: true }
+      });
+
+      if (gymSubscription) {
+        targetGymId = gymSubscription.gymId;
+      }
+    }
+
+    // E. Locate Gym by Stripe Connected Account ID (for Connect webhooks)
+    if (!targetGymId && normalizedEvent.stripeAccountId) {
+      const providerRecord = await prisma.paymentProvider.findFirst({
+        where: { stripeAccountId: normalizedEvent.stripeAccountId }
+      });
+      if (providerRecord) {
+        targetGymId = providerRecord.gymId;
+      }
+    }
+
     // If no matching internal financial record was found, do NOT create fake records
     if (!targetGymId) {
       return {
@@ -147,6 +172,15 @@ class PaymentWebhookService {
                 }
               });
             }
+
+            // Synchronize linked commission transaction to COLLECTED
+            await tx.commissionTransaction.updateMany({
+              where: { paymentId: payment.id },
+              data: {
+                status: 'COLLECTED',
+                stripePaymentIntentId: normalizedEvent.providerPaymentId || payment.providerPaymentId
+              }
+            });
 
             // Record payment attempt
             await tx.paymentAttempt.create({
@@ -218,34 +252,93 @@ class PaymentWebhookService {
                 failureReason: preservedFailureReason
               }
             });
+
+            if (payment.invoiceId) {
+              const currentInv = await tx.invoice.findUnique({ where: { id: payment.invoiceId } });
+              const invNotes = currentInv?.notes
+                ? `${currentInv.notes} | ${refundStamp}`
+                : refundStamp;
+
+              await tx.invoice.update({
+                where: { id: payment.invoiceId },
+                data: {
+                  status: 'VOID',
+                  notes: invNotes
+                }
+              });
+            }
+
+            // Synchronize linked commission transaction to REFUNDED
+            await tx.commissionTransaction.updateMany({
+              where: { paymentId: payment.id },
+              data: { status: 'REFUNDED' }
+            });
           }
           break;
         }
 
-        case 'INVOICE_PAID': {
-          const invId = invoice ? invoice.id : payment?.invoiceId;
-          if (invId) {
-            await tx.invoice.update({
-              where: { id: invId },
+        case 'ACCOUNT_UPDATED': {
+          if (normalizedEvent.stripeAccountId) {
+            const status = (normalizedEvent.chargesEnabled && normalizedEvent.payoutsEnabled) ? 'CONNECTED' : 'SANDBOX';
+            const accountStatus = (normalizedEvent.chargesEnabled && normalizedEvent.payoutsEnabled)
+              ? 'ACTIVE'
+              : (normalizedEvent.detailsSubmitted ? 'PENDING_VERIFICATION' : 'ONBOARDING_REQUIRED');
+
+            await tx.paymentProvider.updateMany({
+              where: { stripeAccountId: normalizedEvent.stripeAccountId },
               data: {
-                status: 'PAID',
-                paidAt: now
+                chargesEnabled: normalizedEvent.chargesEnabled,
+                payoutsEnabled: normalizedEvent.payoutsEnabled,
+                detailsSubmitted: normalizedEvent.detailsSubmitted,
+                stripeAccountStatus: accountStatus,
+                status
               }
             });
           }
           break;
         }
 
-        case 'INVOICE_PAYMENT_FAILED': {
-          const invId = invoice ? invoice.id : payment?.invoiceId;
-          if (invId) {
-            const currentInvoice = await tx.invoice.findUnique({ where: { id: invId } });
-            // Only transition to OVERDUE if not already settled as PAID
-            if (currentInvoice && currentInvoice.status !== 'PAID') {
-              await tx.invoice.update({
-                where: { id: invId },
+        case 'TRANSFER_CREATED': {
+          if (normalizedEvent.transferId && (payment || normalizedEvent.internalPaymentId)) {
+            const targetPayId = payment ? payment.id : normalizedEvent.internalPaymentId;
+            await tx.commissionTransaction.updateMany({
+              where: { paymentId: targetPayId },
+              data: { stripeTransferId: normalizedEvent.transferId }
+            });
+          }
+          break;
+        }
+
+        case 'PAYOUT_PAID':
+        case 'PAYOUT_FAILED':
+        case 'PAYOUT_CREATED': {
+          if (targetGymId && normalizedEvent.payoutId) {
+            const payoutStatus = normalizedEvent.type === 'PAYOUT_PAID'
+              ? 'PAID'
+              : (normalizedEvent.type === 'PAYOUT_FAILED' ? 'FAILED' : 'IN_TRANSIT');
+
+            const existingPayout = await tx.payoutRecord.findFirst({
+              where: { stripePayoutId: normalizedEvent.payoutId }
+            });
+
+            if (existingPayout) {
+              await tx.payoutRecord.update({
+                where: { id: existingPayout.id },
                 data: {
-                  status: 'OVERDUE'
+                  status: payoutStatus,
+                  failureReason: normalizedEvent.failureReason || null
+                }
+              });
+            } else {
+              await tx.payoutRecord.create({
+                data: {
+                  gymId: targetGymId,
+                  stripePayoutId: normalizedEvent.payoutId,
+                  stripeAccountId: normalizedEvent.stripeAccountId,
+                  amount: normalizedEvent.amount,
+                  currency: normalizedEvent.currency,
+                  status: payoutStatus,
+                  failureReason: normalizedEvent.failureReason || null
                 }
               });
             }
@@ -253,8 +346,109 @@ class PaymentWebhookService {
           break;
         }
 
+        case 'INVOICE_PAID': {
+          if (gymSubscription) {
+            const intervalMonths = gymSubscription.billingInterval === 'YEARLY' ? 12 : 1;
+            const newPeriodEnd = new Date(now);
+            newPeriodEnd.setMonth(newPeriodEnd.getMonth() + intervalMonths);
+            const gracePeriodDays = gymSubscription.plan?.gracePeriodDays || 7;
+            const gracePeriodEnd = new Date(newPeriodEnd.getTime() + gracePeriodDays * 24 * 60 * 60 * 1000);
+
+            await tx.gymSubscription.update({
+              where: { id: gymSubscription.id },
+              data: {
+                status: 'ACTIVE',
+                currentPeriodStart: now,
+                currentPeriodEnd: newPeriodEnd,
+                gracePeriodEnd: gracePeriodEnd,
+                cancelledAt: null,
+                cancelAtPeriodEnd: false
+              }
+            });
+
+            await tx.gymSubscriptionInvoice.create({
+              data: {
+                gymId: targetGymId,
+                subscriptionId: gymSubscription.id,
+                invoiceNumber: normalizedEvent.invoiceNumber || `SAAS-INV-${Date.now()}`,
+                amount: normalizedEvent.amount || gymSubscription.price,
+                currency: normalizedEvent.currency || gymSubscription.currency,
+                status: 'PAID',
+                billingPeriodStart: now,
+                billingPeriodEnd: newPeriodEnd,
+                paidAt: now,
+                stripeInvoiceId: normalizedEvent.invoiceId || null
+              }
+            });
+          } else {
+            const invId = invoice ? invoice.id : payment?.invoiceId;
+            if (invId) {
+              await tx.invoice.update({
+                where: { id: invId },
+                data: {
+                  status: 'PAID',
+                  paidAt: now
+                }
+              });
+            }
+          }
+          break;
+        }
+
+        case 'INVOICE_PAYMENT_FAILED': {
+          if (gymSubscription) {
+            const gracePeriodDays = gymSubscription.plan?.gracePeriodDays || 7;
+            const gracePeriodEnd = new Date(now.getTime() + gracePeriodDays * 24 * 60 * 60 * 1000);
+
+            await tx.gymSubscription.update({
+              where: { id: gymSubscription.id },
+              data: {
+                status: 'PAST_DUE',
+                gracePeriodEnd
+              }
+            });
+
+            await tx.gymSubscriptionInvoice.create({
+              data: {
+                gymId: targetGymId,
+                subscriptionId: gymSubscription.id,
+                invoiceNumber: normalizedEvent.invoiceNumber || `SAAS-INV-FAIL-${Date.now()}`,
+                amount: normalizedEvent.amount || gymSubscription.price,
+                currency: normalizedEvent.currency || gymSubscription.currency,
+                status: 'FAILED',
+                billingPeriodStart: now,
+                billingPeriodEnd: gymSubscription.currentPeriodEnd,
+                failureReason: normalizedEvent.failureReason || 'Subscription renewal payment failed'
+              }
+            });
+          } else {
+            const invId = invoice ? invoice.id : payment?.invoiceId;
+            if (invId) {
+              const currentInvoice = await tx.invoice.findUnique({ where: { id: invId } });
+              // Only transition to OVERDUE if not already settled as PAID
+              if (currentInvoice && currentInvoice.status !== 'PAID') {
+                await tx.invoice.update({
+                  where: { id: invId },
+                  data: {
+                    status: 'OVERDUE'
+                  }
+                });
+              }
+            }
+          }
+          break;
+        }
+
         case 'SUBSCRIPTION_CANCELLED': {
-          if (recurringBilling && recurringBilling.status !== 'CANCELLED') {
+          if (gymSubscription) {
+            await tx.gymSubscription.update({
+              where: { id: gymSubscription.id },
+              data: {
+                status: 'CANCELLED',
+                cancelledAt: now
+              }
+            });
+          } else if (recurringBilling && recurringBilling.status !== 'CANCELLED') {
             await tx.recurringBilling.update({
               where: { id: recurringBilling.id },
               data: {

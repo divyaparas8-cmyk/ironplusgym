@@ -26,7 +26,7 @@ export const verifyAuth = (req, res, next) => {
   try {
     const decoded = verifyToken(token);
 
-    if (!decoded || !decoded.userId || !decoded.gymId) {
+    if (!decoded || !decoded.userId || (!decoded.gymId && decoded.role !== 'SUPER_ADMIN')) {
       return res.status(401).json({
         success: false,
         message: 'Invalid or expired token'
@@ -36,7 +36,7 @@ export const verifyAuth = (req, res, next) => {
     // Attach verified identity strictly from token
     req.user = {
       userId: decoded.userId,
-      gymId: decoded.gymId,
+      gymId: decoded.gymId || null,
       role: decoded.role
     };
 
@@ -48,3 +48,4 @@ export const verifyAuth = (req, res, next) => {
     });
   }
 };
+

@@ -3,7 +3,8 @@ import {
   getOverviewReport,
   getRevenueReport,
   getMembersReport,
-  getPaymentsReport
+  getPaymentsReport,
+  getCommissionReport
 } from '../controllers/reportController.js';
 import { verifyAuth } from '../middleware/auth.js';
 
@@ -15,5 +16,7 @@ router.get('/overview', getOverviewReport);
 router.get('/revenue', getRevenueReport);
 router.get('/members', getMembersReport);
 router.get('/payments', getPaymentsReport);
+router.get('/commission', getCommissionReport);
 
 export default router;
+

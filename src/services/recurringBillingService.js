@@ -1,6 +1,7 @@
 import prisma from '../prisma.js';
 import paymentGateway from './paymentGateway/paymentGateway.js';
 import DunningService from './dunningService.js';
+import CommissionService from './commissionService.js';
 import { ALLOWED_SUBSCRIPTION_STATUS_TRANSITIONS } from '../validators/recurringBillingValidator.js';
 
 /**
@@ -273,13 +274,22 @@ class RecurringBillingService {
       }
     }
 
+    let scheduleCurrency = data.currency ? data.currency.toUpperCase() : null;
+    if (!scheduleCurrency) {
+      const gymRecord = await prisma.gym.findUnique({
+        where: { id: gymId },
+        select: { currency: true }
+      });
+      scheduleCurrency = (gymRecord?.currency || 'USD').toUpperCase();
+    }
+
     const created = await prisma.recurringBilling.create({
       data: {
         gymId,
         memberId: data.memberId,
         membershipId: data.membershipId,
         amount: Number(data.amount),
-        currency: data.currency ? data.currency.toUpperCase() : 'USD',
+        currency: scheduleCurrency,
         billingFrequency: data.billingFrequency || 'MONTHLY',
         nextBillingDate: new Date(data.nextBillingDate),
         status: data.status || 'ACTIVE'
@@ -629,9 +639,10 @@ class RecurringBillingService {
               subtotal,
               tax,
               total,
+              currency: schedule.currency || 'USD',
               dueDate: schedule.nextBillingDate,
               status: 'OPEN',
-              notes: `Automated recurring billing (${schedule.billingFrequency}) - Subtotal: $${subtotal.toFixed(2)}, Tax: $${tax.toFixed(2)}`
+              notes: `Automated recurring billing (${schedule.billingFrequency}) - Subtotal: ${schedule.currency || 'USD'} ${subtotal.toFixed(2)}, Tax: ${schedule.currency || 'USD'} ${tax.toFixed(2)}`
             }
           });
 
@@ -661,36 +672,84 @@ class RecurringBillingService {
           continue;
         }
 
-        // 3. Post-invoice Gateway Charge Execution
-        if (paymentMethod && paymentMethod.status === 'ACTIVE') {
+        // 3. Post-invoice Gateway Charge Execution (Electronic Cards & ACH only)
+        if (paymentMethod && paymentMethod.status === 'ACTIVE' && !['CASH', 'POS'].includes(paymentMethod.type)) {
+          // Resolve Gym Payment Mode & Connect Account
+          const gymRecord = await prisma.gym.findUnique({
+            where: { id: gymId },
+            include: {
+              paymentProviders: {
+                where: { provider: 'STRIPE' }
+              }
+            }
+          });
+
+          const isConnectMode = gymRecord?.paymentMode === 'CONNECT_PLATFORM';
+          const provider = gymRecord?.paymentProviders?.[0];
+          const connectedAccountId = (isConnectMode && provider?.stripeAccountId) ? provider.stripeAccountId : null;
+
+          let commission = { platformFee: 0, gymNetAmount: outcome.total };
+          if (isConnectMode) {
+            commission = await CommissionService.calculatePlatformFee({
+              gymId,
+              grossAmount: outcome.total,
+              currency: schedule.currency || 'USD'
+            });
+          }
+
           const chargeRes = await paymentGateway.createRecurringCharge({
             amount: outcome.total,
             currency: schedule.currency || 'USD',
             paymentMethodType: paymentMethod.type,
             providerPaymentMethodId: paymentMethod.providerPaymentMethodId,
-            customerId: schedule.member.id
+            customerId: schedule.member.id,
+            connectedAccountId,
+            applicationFeeAmount: isConnectMode ? commission.platformFee : null,
+            metadata: {
+              gymId,
+              recurringBillingId: schedule.id,
+              invoiceId: outcome.invoiceId,
+              paymentId: outcome.paymentId
+            }
           });
 
           if (chargeRes.status === 'PAID') {
             const nextDate = calculateNextBillingDate(schedule.nextBillingDate, schedule.billingFrequency);
-            await prisma.$transaction([
-              prisma.payment.update({
+            await prisma.$transaction(async (tx) => {
+              await tx.payment.update({
                 where: { id: outcome.paymentId },
                 data: {
                   status: 'PAID',
                   settledDate: now,
                   providerPaymentId: chargeRes.providerPaymentId
                 }
-              }),
-              prisma.invoice.update({
+              });
+              await tx.invoice.update({
                 where: { id: outcome.invoiceId },
                 data: { status: 'PAID', paidAt: now }
-              }),
-              prisma.recurringBilling.update({
+              });
+              await tx.recurringBilling.update({
                 where: { id: schedule.id },
-                data: { nextBillingDate: nextDate, lastRetryDate: now, status: 'ACTIVE' }
-              })
-            ]);
+                data: { nextBillingDate: nextDate, lastRetryDate: now, status: 'ACTIVE', retryCount: 0 }
+              });
+
+              if (isConnectMode && commission.platformFee >= 0) {
+                await CommissionService.recordCommissionTransaction({
+                  tx,
+                  gymId,
+                  paymentId: outcome.paymentId,
+                  invoiceId: outcome.invoiceId,
+                  grossAmount: outcome.total,
+                  platformFee: commission.platformFee,
+                  gymNetAmount: commission.gymNetAmount,
+                  currency: schedule.currency || 'USD',
+                  status: 'COLLECTED',
+                  stripePaymentIntentId: chargeRes.providerPaymentId,
+                  stripeTransferId: chargeRes.transferId,
+                  stripeChargeId: chargeRes.chargeId
+                });
+              }
+            });
           } else if (chargeRes.status === 'FAILED') {
             await prisma.$transaction([
               prisma.payment.update({
@@ -713,13 +772,33 @@ class RecurringBillingService {
             const nextDate = calculateNextBillingDate(schedule.nextBillingDate, schedule.billingFrequency);
             await prisma.payment.update({
               where: { id: outcome.paymentId },
-              data: { failureReason: 'Gateway configuration required for live recurring charge' }
+              data: {
+                status: 'PENDING',
+                failureReason: chargeRes.failureReason || 'Payment provider keys not configured'
+              }
             });
             await prisma.recurringBilling.update({
               where: { id: schedule.id },
-              data: { nextBillingDate: nextDate, lastRetryDate: now }
+              data: { nextBillingDate: nextDate, status: 'ACTIVE' }
             });
           }
+        } else if (paymentMethod && ['CASH', 'POS'].includes(paymentMethod.type)) {
+          // Manual Front-Desk Cash Collection workflow: external gateway is never invoked.
+          // Invoice is created, payment remains PENDING awaiting front-desk collection, schedule advances.
+          const nextDate = calculateNextBillingDate(schedule.nextBillingDate, schedule.billingFrequency);
+          await prisma.$transaction([
+            prisma.payment.update({
+              where: { id: outcome.paymentId },
+              data: {
+                paymentMethodType: paymentMethod.type,
+                failureReason: 'Awaiting front-desk cash collection for scheduled cycle'
+              }
+            }),
+            prisma.recurringBilling.update({
+              where: { id: schedule.id },
+              data: { nextBillingDate: nextDate, status: 'ACTIVE' }
+            })
+          ]);
         } else {
           // No payment method on file: mark FAILED and trigger dunning
           await prisma.payment.update({

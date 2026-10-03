@@ -30,13 +30,13 @@ async function main() {
 
   console.log(`✅ Gym verified: ${gym.tradeName} (${gym.id})`);
 
-  // 2. Create Default Gym Owner User (Credentials: owner@ironpulse.club / IronPulse2026!)
-  const ownerPasswordHash = bcrypt.hashSync('IronPulse2026!', 10);
+  // 2. Create Default Gym Owner User (Credentials: demo@gmail.com / 12345678)
+  const ownerPasswordHash = bcrypt.hashSync('12345678', 10);
   const ownerUser = await prisma.user.upsert({
     where: {
       gymId_email: {
         gymId: gym.id,
-        email: 'owner@ironpulse.club'
+        email: 'demo@gmail.com'
       }
     },
     update: {
@@ -45,7 +45,7 @@ async function main() {
     create: {
       gymId: gym.id,
       name: 'IronPulse Owner',
-      email: 'owner@ironpulse.club',
+      email: 'demo@gmail.com',
       passwordHash: ownerPasswordHash,
       role: 'OWNER',
       status: 'ACTIVE'
@@ -53,6 +53,37 @@ async function main() {
   });
 
   console.log(`✅ Owner User verified: ${ownerUser.email}`);
+
+  // 2b. Create Platform Super Admin User (superadmin@gmail.com / 123456)
+  const superAdminPasswordHash = bcrypt.hashSync('123456', 10);
+  const existingSuperAdmin = await prisma.user.findFirst({
+    where: { email: 'superadmin@gmail.com' }
+  });
+
+  if (existingSuperAdmin) {
+    await prisma.user.update({
+      where: { id: existingSuperAdmin.id },
+      data: {
+        passwordHash: superAdminPasswordHash,
+        role: 'SUPER_ADMIN',
+        status: 'ACTIVE',
+        name: 'Platform Super Admin'
+      }
+    });
+  } else {
+    await prisma.user.create({
+      data: {
+        name: 'Platform Super Admin',
+        email: 'superadmin@gmail.com',
+        passwordHash: superAdminPasswordHash,
+        role: 'SUPER_ADMIN',
+        status: 'ACTIVE',
+        gymId: null
+      }
+    });
+  }
+
+  console.log('✅ Super Admin User verified: superadmin@gmail.com (password: 123456)');
 
   // 3. Billing Policy
   await prisma.billingPolicy.upsert({

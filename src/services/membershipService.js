@@ -162,6 +162,7 @@ export class MembershipService {
     }
 
     const price = data.price !== undefined ? data.price : plan.price;
+    const currency = (data.currency || plan.currency || 'USD').toUpperCase();
     const billingFrequency = data.billingFrequency || plan.billingFrequency;
     const startDate = data.startDate ? new Date(data.startDate) : new Date();
     const endDate = data.endDate ? new Date(data.endDate) : null;
@@ -175,6 +176,7 @@ export class MembershipService {
         planId: plan.id,
         status,
         price,
+        currency,
         billingFrequency,
         startDate,
         endDate,
